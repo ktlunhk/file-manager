@@ -265,12 +265,14 @@ public class MainActivity extends Activity {
 		root.setBackgroundColor(colBg);
 
 		TextView bar = new TextView(this);
-		bar.setText("  myFiles");
+		bar.setText("myFiles");
 		bar.setTextSize(20);
 		bar.setTextColor(Color.WHITE);
+		bar.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.NORMAL);
 		bar.setGravity(Gravity.CENTER_VERTICAL);
-		bar.setBackgroundColor(Color.rgb(45, 105, 160));
-		root.addView(bar, new LinearLayout.LayoutParams(-1, 52 * dp));
+		bar.setPadding(10 * dp, 0, 0, 0);
+		bar.setBackgroundColor(Color.BLUE);
+		root.addView(bar, new LinearLayout.LayoutParams(-1, 58 * dp));
 		root.addView(toolBar(), new LinearLayout.LayoutParams(-1, 70 * dp));
 		root.addView(utilBar(), new LinearLayout.LayoutParams(-1, 42 * dp));
 
