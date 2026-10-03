@@ -1960,6 +1960,8 @@ public class MainActivity extends Activity {
 	}
 
 	public void onBackPressed() {
+		if (previewManager != null && previewManager.isShowingPreview() && previewManager.handleBack())
+			return;
 		if (showingSettings || (previewManager != null && previewManager.isShowingPreview())) {
 			showMain();
 			return;
