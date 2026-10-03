@@ -5,6 +5,15 @@ import android.os.*;
 import android.content.*;
 import android.graphics.Color;
 import android.net.Uri;
+import android.util.TypedValue;
+import android.text.Editable;
+import android.text.Layout;
+import android.text.Spannable;
+import android.text.SpannableStringBuilder;
+import android.text.TextWatcher;
+import android.text.style.BackgroundColorSpan;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 import android.view.*;
 import android.widget.*;
 import java.io.*;
@@ -18,10 +27,21 @@ class PreviewManager {
     private boolean showingPreview;
     private int previewGen;
     private Runnable previewCleanup;
+    private TextViewer activeViewer;
 
     PreviewManager(MainActivity activity) { this.activity = activity; }
 
     boolean isShowingPreview() { return showingPreview; }
+
+    /** Lets the text viewer swallow Back to close its search bar first. */
+    boolean handleBack() {
+        if (activeViewer != null && activeViewer.searchBar != null
+                && activeViewer.searchBar.getVisibility() == View.VISIBLE) {
+            activeViewer.closeSearch();
+            return true;
+        }
+        return false;
+    }
 
     void onMainShown() {
         showingPreview = false;
@@ -529,69 +549,443 @@ class PreviewManager {
 				return;
 			}
 		}
-		
-		int lineCount = 1;
-		for (int i = 0; i < content.length(); i++)
-			if (content.charAt(i) == '\n')
-				lineCount++;
-		StringBuilder nums = new StringBuilder();
-		for (int i = 1; i <= lineCount; i++) {
-			if (i > 1)
-				nums.append('\n');
-			nums.append(i);
+		String nm = f.getName();
+		int dot = nm.lastIndexOf('.');
+		String ext = dot >= 0 ? nm.substring(dot + 1) : "";
+		new TextViewer(f, content, ext).show();
+	}
+
+	/** Text preview with wrap toggle, find-in-text, copy and syntax colouring. */
+	class TextViewer {
+		final File file;
+		final String content, ext;
+		PreviewTextView tv;
+		LineNumberView lineNums;
+		TextView wrapBtn, countTv;
+		LinearLayout searchBar;
+		EditText searchBox;
+		boolean wrap;
+		final ArrayList<Integer> hits = new ArrayList<Integer>();
+		final ArrayList<Object> hitSpans = new ArrayList<Object>();
+		Object curSpan;
+		int hitLen, cur = -1;
+		boolean capped;
+		static final int MAX_HITS = 5000;
+
+		TextViewer(File f, String content, String ext) {
+			this.file = f;
+			this.content = content;
+			this.ext = ext;
 		}
-		TextView lineNums = new TextView(activity);
-		lineNums.setText(nums.toString());
-		lineNums.setTypeface(android.graphics.Typeface.MONOSPACE);
-		lineNums.setTextSize(12);
-		lineNums.setTextColor(activity.colTextMuted);
-		lineNums.setGravity(Gravity.RIGHT);
-		lineNums.setBackgroundColor(activity.colSurfaceAlt);
-		lineNums.setPadding(10 * activity.dp, 10 * activity.dp, 8 * activity.dp, 10 * activity.dp);
 
-		View divider = new View(activity);
-		divider.setBackgroundColor(activity.colDivider);
+		TextView toolBtn(String label) {
+			TextView b = new TextView(activity);
+			b.setText(label);
+			b.setTextSize(13);
+			b.setTextColor(activity.colText);
+			b.setGravity(Gravity.CENTER);
+			b.setPadding(10 * activity.dp, 0, 10 * activity.dp, 0);
+			activity.applyRipple(b);
+			return b;
+		}
 
-		TextView tv = new TextView(activity);
-		tv.setText(content);
-		tv.setTypeface(android.graphics.Typeface.MONOSPACE);
-		tv.setTextSize(12);
-		tv.setTextColor(activity.colText);
-		tv.setTextIsSelectable(true);
-		tv.setPadding(10 * activity.dp, 10 * activity.dp, 14 * activity.dp, 10 * activity.dp);
-		HorizontalScrollView hsv = new HorizontalScrollView(activity);
-		hsv.addView(tv, new FrameLayout.LayoutParams(-2, -2));
+		void show() {
+			int lineCount = 1;
+			for (int i = 0; i < content.length(); i++)
+				if (content.charAt(i) == '\n')
+					lineCount++;
 
-		LinearLayout row = new LinearLayout(activity);
-		row.setOrientation(LinearLayout.HORIZONTAL);
-		row.addView(lineNums, new LinearLayout.LayoutParams(-2, -2));
-		row.addView(divider, new LinearLayout.LayoutParams((1 * activity.dp), -1));
-		row.addView(hsv, new LinearLayout.LayoutParams(0, -2, 1));
+			// Same structure as the text editor: the text view scrolls itself and the gutter
+			// paints only the visible rows from its layout, so zoom/scroll stay fast on big files.
+			tv = new PreviewTextView(activity);
+			tv.setText(content, TextView.BufferType.SPANNABLE);
+			tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+			tv.setBaseSp(12f);
+			tv.setTextColor(activity.colText);
+			tv.setBackgroundColor(activity.colSurface);
+			tv.setGravity(Gravity.TOP | Gravity.LEFT);
+			tv.setPadding(10 * activity.dp, 10 * activity.dp, 14 * activity.dp, 10 * activity.dp);
 
-		ScrollView sv = new ScrollView(activity);
-		sv.setFillViewport(true);
-		sv.setBackgroundColor(activity.colSurface);
-		sv.addView(row, new FrameLayout.LayoutParams(-1, -2));
+			lineNums = new LineNumberView(activity);
+			lineNums.setTypeface(android.graphics.Typeface.MONOSPACE);
+			lineNums.setTextSize(12);
+			lineNums.setNumberColor(activity.colTextMuted);
+			lineNums.setBackgroundColor(activity.colSurfaceAlt);
+			lineNums.setPadding(10 * activity.dp, 10 * activity.dp, 8 * activity.dp, 10 * activity.dp);
+			lineNums.attach(tv);
 
-		ZoomTextContainer zoomWrap = new ZoomTextContainer(activity, Arrays.asList(tv, lineNums));
-		zoomWrap.addView(sv, new FrameLayout.LayoutParams(-1, -1));
-		showPreviewScreen(f.getName(), zoomWrap, f);
+			View divider = new View(activity);
+			divider.setBackgroundColor(activity.colDivider);
+
+			tv.setViewListener(new PreviewTextView.Listener() {
+				public void onViewScrolled() {
+					lineNums.invalidate();
+				}
+			});
+			tv.setZoomHook(new Runnable() {
+				public void run() {
+					lineNums.setTextSize(TypedValue.COMPLEX_UNIT_PX, tv.getTextSize());
+					lineNums.updateWidth();
+					lineNums.invalidate();
+				}
+			});
+
+			LinearLayout zoomWrap = new LinearLayout(activity);
+			zoomWrap.setOrientation(LinearLayout.HORIZONTAL);
+			zoomWrap.addView(lineNums, new LinearLayout.LayoutParams(40 * activity.dp, -1));
+			zoomWrap.addView(divider, new LinearLayout.LayoutParams(1 * activity.dp, -1));
+			zoomWrap.addView(tv, new LinearLayout.LayoutParams(0, -1, 1));
+			lineNums.setTotalLines(lineCount);
+
+			// ---- tool row: Wrap / Search / Copy ----
+			LinearLayout tools = new LinearLayout(activity);
+			tools.setOrientation(LinearLayout.HORIZONTAL);
+			tools.setBackgroundColor(activity.colSurfaceAlt);
+			wrapBtn = toolBtn("No wrap");
+			TextView searchBtn = toolBtn("Search");
+			TextView copyBtn = toolBtn("Copy");
+			tools.addView(wrapBtn, new LinearLayout.LayoutParams(0, -1, 1));
+			tools.addView(searchBtn, new LinearLayout.LayoutParams(0, -1, 1));
+			tools.addView(copyBtn, new LinearLayout.LayoutParams(0, -1, 1));
+			wrapBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					setWrap(!wrap);
+				}
+			});
+			searchBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					if (searchBar.getVisibility() == View.VISIBLE) closeSearch();
+					else openSearch();
+				}
+			});
+			copyBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					copyText();
+				}
+			});
+
+			// ---- search bar (hidden until Search is tapped) ----
+			searchBar = new LinearLayout(activity);
+			searchBar.setOrientation(LinearLayout.HORIZONTAL);
+			searchBar.setGravity(Gravity.CENTER_VERTICAL);
+			searchBar.setBackgroundColor(activity.colSurfaceAlt);
+			searchBar.setPadding(10 * activity.dp, 0, 0, 0);
+			searchBar.setVisibility(View.GONE);
+			searchBox = new EditText(activity);
+			searchBox.setHint("Find in text");
+			searchBox.setTextSize(14);
+			searchBox.setTextColor(activity.colText);
+			searchBox.setHintTextColor(activity.colTextMuted);
+			searchBox.setSingleLine(true);
+			searchBox.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+			searchBar.addView(searchBox, new LinearLayout.LayoutParams(0, -2, 1));
+			countTv = new TextView(activity);
+			countTv.setTextSize(12);
+			countTv.setTextColor(activity.colTextMuted);
+			countTv.setPadding(8 * activity.dp, 0, 4 * activity.dp, 0);
+			searchBar.addView(countTv, new LinearLayout.LayoutParams(-2, -2));
+			TextView prev = toolBtn("\u25B2");
+			TextView next = toolBtn("\u25BC");
+			TextView close = toolBtn("\u2715");
+			prev.setContentDescription("Previous match");
+			next.setContentDescription("Next match");
+			close.setContentDescription("Close search");
+			searchBar.addView(prev, new LinearLayout.LayoutParams(-2, 44 * activity.dp));
+			searchBar.addView(next, new LinearLayout.LayoutParams(-2, 44 * activity.dp));
+			searchBar.addView(close, new LinearLayout.LayoutParams(-2, 44 * activity.dp));
+			prev.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					step(-1);
+				}
+			});
+			next.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					step(1);
+				}
+			});
+			close.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					closeSearch();
+				}
+			});
+			searchBox.addTextChangedListener(new TextWatcher() {
+				public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+				}
+
+				public void onTextChanged(CharSequence s, int a, int b, int c) {
+				}
+
+				public void afterTextChanged(Editable e) {
+					updateHits(true);
+				}
+			});
+			searchBox.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+				public boolean onEditorAction(TextView v, int actionId, KeyEvent ev) {
+					step(1);
+					return true; // keep the keyboard up for repeated "next"
+				}
+			});
+
+			LinearLayout screen = new LinearLayout(activity);
+			screen.setOrientation(LinearLayout.VERTICAL);
+			screen.addView(tools, new LinearLayout.LayoutParams(-1, 40 * activity.dp));
+			screen.addView(searchBar, new LinearLayout.LayoutParams(-1, -2));
+			screen.addView(zoomWrap, new LinearLayout.LayoutParams(-1, 0, 1));
+
+			setWrap(false);
+			showPreviewScreen(file.getName(), screen, file);
+			final int gen = previewGen;
+			activeViewer = this;
+			previewCleanup = new Runnable() {
+				public void run() {
+					activeViewer = null;
+					hideKeyboard();
+				}
+			};
+
+			// Colour in the background so the file shows up instantly.
+			new Thread(new Runnable() {
+				public void run() {
+					SpannableStringBuilder styled = null;
+					try {
+						styled = new SyntaxHighlighter(activity.dark).highlight(content, ext);
+					} catch (Throwable t) {
+						styled = null; // highlighting is cosmetic - never let it break the preview
+					}
+					final SpannableStringBuilder fs = styled;
+					if (fs == null) return;
+					activity.runOnUiThread(new Runnable() {
+						public void run() {
+							if (gen != previewGen) return;
+							tv.setText(fs, TextView.BufferType.SPANNABLE);
+							hitSpans.clear(); // setText dropped the old search spans
+							curSpan = null;
+							if (searchBar.getVisibility() == View.VISIBLE) updateHits(false);
+						}
+					});
+				}
+			}).start();
+		}
+
+		void setWrap(boolean w) {
+			wrap = w;
+			wrapBtn.setText(w ? "Wrap" : "No wrap");
+			tv.setHorizontallyScrolling(!w); // gutter stays; wrapped rows simply get no number
+			if (cur >= 0 && cur < hits.size()) {
+				tv.post(new Runnable() {
+					public void run() {
+						tv.revealOffset(hits.get(cur));
+					}
+				});
+			}
+		}
+
+		void openSearch() {
+			searchBar.setVisibility(View.VISIBLE);
+			int s = tv.getSelectionStart(), e = tv.getSelectionEnd();
+			if (s >= 0 && e >= 0 && s != e) {
+				String sel = content.substring(Math.min(s, e), Math.max(s, e));
+				if (sel.length() <= 100 && sel.indexOf('\n') < 0) {
+					searchBox.setText(sel);
+					searchBox.setSelection(sel.length());
+				}
+			}
+			searchBox.requestFocus();
+			InputMethodManager imm = (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+			if (imm != null) imm.showSoftInput(searchBox, 0);
+			updateHits(false);
+		}
+
+		void closeSearch() {
+			hideKeyboard();
+			clearHitSpans();
+			hits.clear();
+			cur = -1;
+			searchBar.setVisibility(View.GONE);
+		}
+
+		void hideKeyboard() {
+			try {
+				InputMethodManager imm = (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+				if (imm != null) imm.hideSoftInputFromWindow(activity.getWindow().getDecorView().getWindowToken(), 0);
+			} catch (Exception e) {
+			}
+		}
+
+		void clearHitSpans() {
+			CharSequence t = tv.getText();
+			if (t instanceof Spannable) {
+				Spannable sp = (Spannable) t;
+				for (Object o : hitSpans) sp.removeSpan(o);
+				if (curSpan != null) sp.removeSpan(curSpan);
+			}
+			hitSpans.clear();
+			curSpan = null;
+		}
+
+		void updateHits(boolean jump) {
+			clearHitSpans();
+			hits.clear();
+			cur = -1;
+			capped = false;
+			String q = searchBox.getText().toString();
+			if (q.length() == 0) {
+				countTv.setText("");
+				return;
+			}
+			hitLen = q.length();
+			int n = content.length() - hitLen;
+			for (int i = 0; i <= n; i++) {
+				if (content.regionMatches(true, i, q, 0, hitLen)) {
+					hits.add(i);
+					if (hits.size() >= MAX_HITS) {
+						capped = true;
+						break;
+					}
+					i += hitLen - 1; // non-overlapping matches
+				}
+			}
+			if (hits.isEmpty()) {
+				countTv.setText("0/0");
+				return;
+			}
+			Spannable sp = (Spannable) tv.getText();
+			int hitColor = activity.dark ? Color.argb(110, 255, 214, 0) : Color.argb(120, 255, 235, 59);
+			for (int h : hits) {
+				BackgroundColorSpan b = new BackgroundColorSpan(hitColor);
+				sp.setSpan(b, h, h + hitLen, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+				hitSpans.add(b);
+			}
+			goTo(0, jump);
+		}
+
+		void step(int dir) {
+			if (hits.isEmpty()) return;
+			goTo((cur + dir + hits.size()) % hits.size(), true);
+		}
+
+		void goTo(int idx, boolean scroll) {
+			cur = idx;
+			Spannable sp = (Spannable) tv.getText();
+			if (curSpan != null) sp.removeSpan(curSpan);
+			curSpan = new BackgroundColorSpan(Color.rgb(255, 143, 0));
+			int h = hits.get(idx);
+			sp.setSpan(curSpan, h, h + hitLen, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+			countTv.setText((idx + 1) + "/" + hits.size() + (capped ? "+" : ""));
+			if (scroll) scrollToHit(h);
+		}
+
+		void scrollToHit(final int start) {
+			if (tv.getLayout() == null) {
+				tv.post(new Runnable() {
+					public void run() {
+						if (tv.getLayout() != null) tv.revealOffset(start);
+					}
+				});
+				return;
+			}
+			tv.revealOffset(start);
+		}
+
+		void copyText() {
+			int s = tv.getSelectionStart(), e = tv.getSelectionEnd();
+			boolean sel = s >= 0 && e >= 0 && s != e;
+			String t = sel ? content.substring(Math.min(s, e), Math.max(s, e)) : content;
+			try {
+				ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+				cm.setPrimaryClip(ClipData.newPlainText(file.getName(), t));
+				activity.toast(sel ? "Copied selection" : "Copied all text");
+			} catch (Exception ex) {
+				activity.toast("Too large to copy - select part of it instead");
+			}
+		}
 	}
 
 	class ZoomTextContainer extends FrameLayout {
 		ScaleGestureDetector scaleDetector;
 		float textSp = 12f;
+		float pending = 1f; // live pinch factor, applied as a cheap view transform until the fingers lift
+		final List<TextView> targets;
 		static final float MIN_SP = 8f, MAX_SP = 28f;
 
 		ZoomTextContainer(Context c, final List<TextView> scalables) {
 			super(c);
+			targets = scalables;
+			setBackgroundColor(activity.colSurface); // so any uncovered edge matches the text background
 			scaleDetector = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-				public boolean onScale(ScaleGestureDetector d) {
-					textSp *= d.getScaleFactor();
-					textSp = Math.max(MIN_SP, Math.min(textSp, MAX_SP));
-					for (TextView tv : scalables)
-						tv.setTextSize(textSp);
+				public boolean onScaleBegin(ScaleGestureDetector d) {
+					pending = 1f;
+					View child = getChildAt(0);
+					if (child != null) child.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 					return true;
+				}
+
+				public boolean onScale(ScaleGestureDetector d) {
+					// Only scale the already-rendered view here. Re-laying out thousands of
+					// lines on every event is what made pinching slow.
+					float target = textSp * pending * d.getScaleFactor();
+					target = Math.max(MIN_SP, Math.min(target, MAX_SP));
+					pending = target / textSp;
+					View child = getChildAt(0);
+					if (child != null) {
+						child.setPivotX(0f); // anchor to the left edge so the line numbers never slide off-screen
+						child.setPivotY(d.getFocusY());
+						child.setScaleX(pending);
+						child.setScaleY(pending);
+						// The view only has pixels for what was on screen when the pinch began, so zooming
+						// out far would leave a blank border. Re-render for real every ~10% instead.
+						if (pending < 0.9f || pending > 1.3f) {
+							commit(d.getFocusX(), d.getFocusY());
+							child.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+						}
+					}
+					return true;
+				}
+
+				public void onScaleEnd(ScaleGestureDetector d) {
+					commit(d.getFocusX(), d.getFocusY());
+				}
+			});
+		}
+
+		void collectScrollers(View v, List<View> out) {
+			if (v instanceof ScrollView || v instanceof HorizontalScrollView) out.add(v);
+			if (v instanceof ViewGroup) {
+				ViewGroup g = (ViewGroup) v;
+				for (int i = 0; i < g.getChildCount(); i++) collectScrollers(g.getChildAt(i), out);
+			}
+		}
+
+		/** Apply the pinch to the real text size once, with a single relayout. */
+		void commit(final float fx, final float fy) {
+			View child = getChildAt(0);
+			if (child != null) {
+				child.setScaleX(1f);
+				child.setScaleY(1f);
+				child.setLayerType(View.LAYER_TYPE_NONE, null);
+			}
+			final float ratio = pending;
+			pending = 1f;
+			if (Math.abs(ratio - 1f) < 0.01f) return;
+			textSp = Math.max(MIN_SP, Math.min(textSp * ratio, MAX_SP));
+			final List<View> scrollers = new ArrayList<View>();
+			if (child != null) collectScrollers(child, scrollers);
+			final int[] sx = new int[scrollers.size()], sy = new int[scrollers.size()];
+			for (int i = 0; i < sx.length; i++) {
+				sx[i] = scrollers.get(i).getScrollX();
+				sy[i] = scrollers.get(i).getScrollY();
+			}
+			for (TextView tv : targets)
+				tv.setTextSize(textSp);
+			// keep the content under the fingers in place after the relayout
+			post(new Runnable() {
+				public void run() {
+					for (int i = 0; i < sx.length; i++) {
+						View sc = scrollers.get(i);
+						int nx = Math.round(sx[i] * ratio); // pinch is anchored at the left edge
+						int ny = Math.round((sy[i] + fy) * ratio - fy);
+						sc.scrollTo(Math.max(0, nx), Math.max(0, ny));
+					}
 				}
 			});
 		}
