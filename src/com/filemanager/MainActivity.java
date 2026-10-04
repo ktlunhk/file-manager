@@ -96,6 +96,16 @@ public class MainActivity extends Activity {
 				.show();
 	}
 
+	/** left/right margin of dialog content: same as the dialog title and message (24dp) */
+	void padDialogBox(View box) {
+		box.setPadding(24 * dp, 8 * dp, 24 * dp, 0);
+	}
+
+	/** removes the inner side padding of an input so its text starts exactly under the title */
+	void alignInput(EditText e) {
+		e.setPadding(0, e.getPaddingTop(), 0, e.getPaddingBottom());
+	}
+
 	void themeDialogView(View view) {
 		if (view == null) return;
 		if (view instanceof TextView) {
@@ -2101,6 +2111,22 @@ public class MainActivity extends Activity {
 		}
 	}
 
+	void scrollTreesToTop() {
+		final ScrollView l = leftTreeScroll, r = rightTreeScroll;
+		if (l != null)
+			l.post(new Runnable() {
+				public void run() {
+					l.scrollTo(0, 0);
+				}
+			});
+		if (r != null)
+			r.post(new Runnable() {
+				public void run() {
+					r.scrollTo(0, 0);
+				}
+			});
+	}
+
 	void expandFirstLevel() {
 		expandFirstLevel(leftRoot, leftOpen);
 		expandFirstLevel(rightRoot, rightOpen);
@@ -2811,8 +2837,17 @@ public class MainActivity extends Activity {
 				splitWeight = 1f;
 				bodyRef.requestLayout();
 			}
+			// both panels go back to the Internal storage tree, with only its first level open and the top in view
+			File internal = Environment.getExternalStorageDirectory();
+			leftRoot = internal;
+			rightRoot = internal;
 			expandFirstLevel();
+			leftCur = leftRoot;
+			rightCur = rightRoot;
+			selected = null;
+			pendingBookmarkScrollPath = null;
 			refresh(true, true, false);
+			scrollTreesToTop();
 			return;
 		}
 		if (a == 4) {
@@ -3062,8 +3097,10 @@ public class MainActivity extends Activity {
 				addItem(labels, icons, codes, "\u2722", "Move", 2);
 				addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
 			}
-			addItem(labels, icons, codes, "\uD83D\uDCC1", "New folder", 4);
-			addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
+			if (f.isDirectory()) { // new items are created inside the long-pressed folder, so only folders offer it
+				addItem(labels, icons, codes, "\uD83D\uDCC1", "New folder", 4);
+				addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
+			}
 			if (!sys)
 				addItem(labels, icons, codes, "\u274C", "Delete", 5);
 			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
@@ -3099,8 +3136,10 @@ public class MainActivity extends Activity {
 			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
 			addItem(labels, icons, codes, "\u2722", "Move", 2);
 			addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
-			addItem(labels, icons, codes, "\uD83D\uDCC1", "New folder", 4);
-			addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
+			if (plainFolder) { // new items are created inside the long-pressed folder, so only folders offer it
+				addItem(labels, icons, codes, "\uD83D\uDCC1", "New folder", 4);
+				addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
+			}
 			addItem(labels, icons, codes, "\u274C", "Delete", 5);
 			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
 			addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
@@ -3326,18 +3365,22 @@ public class MainActivity extends Activity {
 		Context cx = b.getContext(); // dialog context, same as the Rename popup
 		LinearLayout box = new LinearLayout(cx);
 		box.setOrientation(LinearLayout.VERTICAL);
+		padDialogBox(box);
 		final EditText em = new EditText(cx);
+		alignInput(em);
 		em.setHint("E-mail");
 		em.setSingleLine(true);
 		em.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
 		em.setText(prefs.getString("mega_last_email", ""));
 		box.addView(em, new LinearLayout.LayoutParams(-1, -2));
 		final EditText pw = new EditText(cx);
+		alignInput(pw);
 		pw.setHint("Password");
 		pw.setSingleLine(true);
 		pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
 		box.addView(pw, new LinearLayout.LayoutParams(-1, -2));
 		final EditText mfa = new EditText(cx);
+		alignInput(mfa);
 		mfa.setHint("2FA code (only if you use it)");
 		mfa.setSingleLine(true);
 		mfa.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
@@ -3349,7 +3392,7 @@ public class MainActivity extends Activity {
 			err.setTextColor(Color.rgb(230, 80, 70));
 			err.setTextSize(13);
 			err.setTextIsSelectable(true);
-			err.setPadding(4 * dp, 10 * dp, 4 * dp, 4 * dp);
+			err.setPadding(0, 10 * dp, 0, 4 * dp);
 			box.addView(err, new LinearLayout.LayoutParams(-1, -2));
 		}
 		ScrollView outer = new ScrollView(cx);
@@ -3959,14 +4002,76 @@ public class MainActivity extends Activity {
 		}
 	}
 
+	/** true when `parent` already holds an item called n (ignoring `self`, the item that is being renamed) */
+	boolean nameTaken(File parent, String n, File self) {
+		if (parent == null || n.length() == 0)
+			return false;
+		if (parent instanceof MegaItem) {
+			String ph = ((MegaItem) parent).handle;
+			String h = self instanceof MegaItem ? ((MegaItem) self).handle : null;
+			String same = MegaClient.child(ph, n, self != null ? self.isDirectory() : true);
+			if (self == null && same == null)
+				same = MegaClient.child(ph, n, false); // new folder: a file with that name blocks it too
+			return same != null && !same.equals(h);
+		}
+		if (parent instanceof ZipItem || self instanceof ZipItem) {
+			File[] c = parent.listFiles();
+			if (c != null)
+				for (int i = 0; i < c.length; i++)
+					if (c[i].getName().equals(n) && (self == null || !c[i].equals(self)))
+						return true;
+			return false;
+		}
+		File x = new File(parent, n);
+		return x.exists() && (self == null || !x.equals(self));
+	}
+
 	void ask(String title, String hint, final int a) {
 		AlertDialog.Builder dialogBuilder = createDialog(title, null);
-		final EditText e = new EditText(dialogBuilder.getContext());
+		android.content.Context cx = dialogBuilder.getContext();
+		final EditText e = new EditText(cx);
 		e.setHint(hint);
+		e.setSingleLine(true);
 		themeDialogView(e);
+		final String original = a == 3 && selected != null ? selected.getName() : "";
 		if (a == 3 && selected != null)
-			e.setText(selected.getName());
-		dialogBuilder.setView(e)
+			e.setText(original);
+		// the input box with a red warning line under it
+		LinearLayout box = new LinearLayout(cx);
+		box.setOrientation(LinearLayout.VERTICAL);
+		padDialogBox(box);
+		alignInput(e);
+		box.addView(e, new LinearLayout.LayoutParams(-1, -2));
+		final TextView warn = new TextView(cx);
+		warn.setText("Already exists");
+		warn.setTextColor(Color.rgb(230, 80, 70));
+		warn.setTextSize(13);
+		warn.setPadding(0, 2 * dp, 0, 0);
+		warn.setVisibility(View.GONE);
+		box.addView(warn, new LinearLayout.LayoutParams(-1, -2));
+		final File parentDir = a == 4 ? (selectedLeft ? leftCur : rightCur)
+				: (selected == null ? null : selected.getParentFile());
+		final File self = a == 3 ? selected : null;
+		final AlertDialog[] dlg = new AlertDialog[1];
+		e.addTextChangedListener(new android.text.TextWatcher() {
+			public void beforeTextChanged(CharSequence s, int st, int c, int af) {
+			}
+
+			public void onTextChanged(CharSequence s, int st, int b, int c) {
+			}
+
+			public void afterTextChanged(android.text.Editable s) {
+				String n = s.toString().trim();
+				boolean dup = !n.equals(original) && nameTaken(parentDir, n, self);
+				warn.setVisibility(dup ? View.VISIBLE : View.GONE);
+				if (dlg[0] != null) {
+					Button ok = dlg[0].getButton(DialogInterface.BUTTON_POSITIVE);
+					if (ok != null)
+						ok.setEnabled(!dup);
+				}
+			}
+		});
+		dialogBuilder.setView(box)
 				.setPositiveButton("OK", new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
 						String n = e.getText().toString().trim();
@@ -4009,7 +4114,23 @@ public class MainActivity extends Activity {
 						}
 						refresh();
 					}
-				}).setNegativeButton("Cancel", null).show();
+				}).setNegativeButton("Cancel", null);
+		dlg[0] = dialogBuilder.show();
+		// cursor in the input box with the keyboard up; a rename puts it just before the extension (.xxx)
+		dlg[0].getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+		int caret = original.length();
+		int dot = original.lastIndexOf('.');
+		if (a == 3 && selected != null && !selected.isDirectory() && dot > 0)
+			caret = dot;
+		final int pos = caret;
+		e.requestFocus();
+		e.setSelection(pos);
+		e.post(new Runnable() {
+			public void run() {
+				e.requestFocus();
+				e.setSelection(Math.min(pos, e.getText().length()));
+			}
+		});
 	}
 
 	void delConfirm() {
