@@ -72,7 +72,7 @@ public class MainActivity extends Activity {
 	AlertDialog.Builder themedDialogBuilder() {
 		int theme = dark ? android.R.style.Theme_Material_Dialog_Alert
 				: android.R.style.Theme_Material_Light_Dialog_Alert;
-		return new AlertDialog.Builder(this, theme);
+		return new DragBuilder(this, theme); // dialogs made by it can be dragged
 	}
 
 	AlertDialog.Builder createDialog(String title, String message) {
@@ -1439,19 +1439,70 @@ public class MainActivity extends Activity {
 	}
 
 	void showTrashMenu() {
-		long[] info = {0, 0}; // count, bytes
-		trashInfo(trashDir(leftRoot), info);
-		if (!leftRoot.equals(rightRoot))
-			trashInfo(trashDir(rightRoot), info);
-		final String msg = info[0] == 0
-				? "Trash is empty."
-				: info[0] + " item" + (info[0] == 1 ? "" : "s") + ", " + human(info[1]);
-		createDialog("Trash", msg)
+		// the window opens at once; the (possibly slow) count of a big trash runs in the background
+		final File lt = trashDir(leftRoot), rt = trashDir(rightRoot);
+		final boolean same = leftRoot.equals(rightRoot);
+		final AlertDialog dlg = createDialog("Trash", "Counting...")
 				.setPositiveButton("Empty Trash", new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
 						emptyTrash();
 					}
 				}).setNegativeButton("Close", null).show();
+		final boolean[] stop = { false };
+		dlg.setOnDismissListener(new DialogInterface.OnDismissListener() {
+			public void onDismiss(DialogInterface d) {
+				stop[0] = true;
+			}
+		});
+		new Thread(new Runnable() {
+			public void run() {
+				long[] t = { 0, 0, 0, 0 }; // files, folders, bytes, last screen update
+				File[] dirs = same ? new File[] { lt } : new File[] { lt, rt };
+				for (int d = 0; d < dirs.length && !stop[0]; d++) {
+					File[] c = dirs[d].isDirectory() ? dirs[d].listFiles() : null;
+					if (c != null)
+						for (int i = 0; i < c.length && !stop[0]; i++)
+							trashWalk(c[i], t, stop, dlg);
+				}
+				if (stop[0])
+					return;
+				final String msg = t[0] + t[1] == 0 ? "Trash is empty."
+						: (t[0] + t[1]) + " item" + (t[0] + t[1] == 1 ? "" : "s") + ", " + human(t[2]);
+				runOnUiThread(new Runnable() {
+					public void run() {
+						if (!stop[0])
+							dlg.setMessage(msg);
+					}
+				});
+			}
+		}).start();
+	}
+
+	/** like tally(), but can be stopped and shows the running count in the trash window */
+	void trashWalk(File f, long[] t, final boolean[] stop, final AlertDialog dlg) {
+		if (stop[0])
+			return;
+		if (f.isDirectory() && !isSymlink(f)) {
+			t[1]++;
+			File[] c = f.listFiles();
+			if (c != null)
+				for (int i = 0; i < c.length && !stop[0]; i++)
+					trashWalk(c[i], t, stop, dlg);
+		} else {
+			t[0]++;
+			t[2] += Math.max(f.length(), 0L);
+		}
+		long now = System.currentTimeMillis();
+		if (now - t[3] > 300) {
+			t[3] = now;
+			final String m = "Counting... " + (t[0] + t[1]) + " items, " + human(t[2]);
+			runOnUiThread(new Runnable() {
+				public void run() {
+					if (!stop[0])
+						dlg.setMessage(m);
+				}
+			});
+		}
 	}
 
 	void trashInfo(File t, long[] out) {
@@ -2266,7 +2317,7 @@ public class MainActivity extends Activity {
 		return false;
 	}
 
-	// Folder cycle: 1) folder ticked  2) folder unticked, children ticked  3) all unticked
+	// Folder cycle: 1) folder ticked  2) folder unticked, children ticked (only when the folder is expanded)  3) all unticked
 	void tickToggle(File f, boolean left) {
 		if (isPaneRoot(f))
 			return;
@@ -2289,7 +2340,9 @@ public class MainActivity extends Activity {
 				multi.add(f);
 		} else if (multi.contains(f)) {
 			multi.remove(f);
-			File[] c = filterHidden(children(f));
+			// the children are ticked only while the folder is expanded; a collapsed folder is simply unticked
+			boolean expanded = (left ? leftOpen : rightOpen).contains(f.getAbsolutePath());
+			File[] c = expanded ? filterHidden(children(f)) : null;
 			if (c != null)
 				for (int i = 0; i < c.length; i++)
 					if (!multi.contains(c[i]))
