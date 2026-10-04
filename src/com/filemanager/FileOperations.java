@@ -25,13 +25,14 @@ class FileOperations {
         j.start();
     }
 
-    void startUploadToMega(ArrayList<File> srcs, MegaItem dstDir) {
-        new MegaUpJob(srcs, dstDir.handle).start();
+    void startUploadToMega(ArrayList<File> srcs, MegaItem dstDir, boolean move) {
+        new MegaUpJob(srcs, dstDir.handle, move).start();
     }
 
     class MegaUpJob {
         final ArrayList<File> srcs;
         final String parent;
+        final boolean move; // delete the local file after it was uploaded
         volatile boolean cancelled;
         volatile long done, total;
         volatile String cur = "Preparing...";
@@ -40,9 +41,10 @@ class FileOperations {
         OperationProgress operationProgress;
         final Runnable updater;
 
-        MegaUpJob(ArrayList<File> srcs, String parent) {
+        MegaUpJob(ArrayList<File> srcs, String parent, boolean move) {
             this.srcs = srcs;
             this.parent = parent;
+            this.move = move;
             updater = new Runnable() {
                 public void run() {
                     if (operationProgress == null) return;
@@ -103,6 +105,10 @@ class FileOperations {
                 if (h == null) h = MegaClient.makeFolder(name, parentHandle);
                 File[] c = f.listFiles();
                 if (c != null) for (int i = 0; i < c.length; i++) upload(c[i], h);
+                if (move) {
+                    File[] left = f.listFiles();
+                    if (left != null && left.length == 0) f.delete();
+                }
                 return;
             }
             if (MegaClient.child(parentHandle, name, false) != null) {
@@ -121,6 +127,7 @@ class FileOperations {
                 }
             });
             uploaded++;
+            if (move) f.delete();
         }
 
         void finish(final String err) {
@@ -133,7 +140,7 @@ class FileOperations {
                     String msg;
                     if (err != null) msg = "Error: " + err;
                     else if (cancelled) msg = "Cancelled";
-                    else msg = "Uploaded " + uploaded + (uploaded == 1 ? " file" : " files")
+                    else msg = (move ? "Moved " : "Uploaded ") + uploaded + (uploaded == 1 ? " file" : " files")
                             + (skipped > 0 ? ", skipped " + skipped + " already in MEGA" : "");
                     activity.selected = null;
                     activity.exitMulti();
@@ -359,6 +366,15 @@ class FileOperations {
 					File[] left = s.listFiles();
 					if (left != null && left.length == 0)
 						s.delete();
+				} else if (move && s instanceof MegaItem && !((MegaItem) s).isSystemNode()) {
+					File[] left = s.listFiles();
+					if (left != null && left.length == 0) {
+						try {
+							MegaClient.trashOrDelete(((MegaItem) s).handle);
+						} catch (IOException e) {
+							moveFail++;
+						}
+					}
 				}
 				return;
 			}
@@ -383,6 +399,12 @@ class FileOperations {
 			if (move && !(s instanceof ZipItem) && !(s instanceof MegaItem)) {
 				if (!s.delete())
 					moveFail++;
+			} else if (move && s instanceof MegaItem) {
+				try {
+					MegaClient.trashOrDelete(((MegaItem) s).handle);
+				} catch (IOException e) {
+					moveFail++;
+				}
 			}
 		}
 
