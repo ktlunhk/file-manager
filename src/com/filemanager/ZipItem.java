@@ -353,7 +353,6 @@ class ZipItem extends File {
 
     static void zipMulti(MainActivity a) {
         ArrayList<File> items = a.multiItems();
-        if (a.hasMega(items)) { a.toast("Copy MEGA files out first, they cannot be zipped"); return; }
         for (int i = 0; i < items.size(); i++) if (items.get(i) instanceof ZipItem) { a.toast("Extract zip entries first, they cannot be zipped"); return; }
         if (items.isEmpty()) return;
         File dstDir = a.multiLeft ? a.rightCur : a.leftCur;
@@ -363,7 +362,18 @@ class ZipItem extends File {
         String base = "Archive";
         if (items.size() == 1) base = items.get(0).getName();
         else if (same && parent != null && !a.isPaneRoot(parent) && parent.getName().length() > 0) base = parent.getName();
-        askZipOptions(a, items, a.uniqueFile(dstDir, base, ".zip"));
+        zipTarget(a, items, dstDir, base);
+    }
+
+    /** picks the zip file: next to the other pane's folder, or a temp file that is uploaded when the other pane is MEGA */
+    static void zipTarget(MainActivity a, ArrayList<File> items, File dstDir, String base) {
+        if (dstDir instanceof MegaItem) {
+            MegaItem md = (MegaItem) dstDir;
+            if (md.isRootNode()) { a.toast("Open a MEGA folder (for example Cloud Drive) first"); return; }
+            if (!MegaClient.isReady()) { a.toast("Connect to MEGA first"); return; }
+            File tmpDir = new File(a.getCacheDir(), "mega-zip"); tmpDir.mkdirs();
+            askZipOptions(a, items, new File(tmpDir, MegaClient.freeName(md.handle, base, ".zip")), md.handle);
+        } else askZipOptions(a, items, a.uniqueFile(dstDir, base, ".zip"), null);
     }
 
     static void zip(MainActivity a) {
@@ -372,11 +382,15 @@ class ZipItem extends File {
         String base = src.getName();
         if (!src.isDirectory()) { int dot = base.lastIndexOf('.'); if (dot > 0) base = base.substring(0, dot); }
         ArrayList<File> one = new ArrayList<File>(); one.add(src);
-        askZipOptions(a, one, a.uniqueFile(dstDir, base, ".zip"));
+        zipTarget(a, one, dstDir, base);
     }
 
     // ---------- password protected zips ----------
     static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out) {
+        askZipOptions(a, items, out, null);
+    }
+
+    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final String megaParent) {
         android.widget.LinearLayout box = new android.widget.LinearLayout(a);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
         box.setPadding(20 * a.dp, 8 * a.dp, 20 * a.dp, 0);
@@ -394,7 +408,7 @@ class ZipItem extends File {
             .setPositiveButton("Create", new android.content.DialogInterface.OnClickListener() {
                 public void onClick(android.content.DialogInterface d, int w) {
                     String p = pw.getText().toString();
-                    zipItems(a, items, out, p.length() > 0 ? p : null, aes.isChecked());
+                    zipItems(a, items, out, p.length() > 0 ? p : null, aes.isChecked(), megaParent);
                 }
             }).setNegativeButton("Cancel", null).show();
     }
@@ -443,6 +457,10 @@ class ZipItem extends File {
     }
 
     static void zipItems(final MainActivity a, final ArrayList<File> items, final File out, final String password, final boolean aes) {
+        zipItems(a, items, out, password, aes, null);
+    }
+
+    static void zipItems(final MainActivity a, final ArrayList<File> items, final File out, final String password, final boolean aes, final String megaParent) {
         final android.app.AlertDialog wait = a.busyDialog("Creating zip", out.getName());
         new Thread(new Runnable() { public void run() {
             String msg; ZipOutputStream zo = null; PZipWriter pz = null;
@@ -464,6 +482,12 @@ class ZipItem extends File {
                 }
                 zo.close(); zo = null; msg = "Created " + out.getName();
                 }
+                if (megaParent != null) {
+                    // the zip was built in the cache: send it to MEGA and remove the temp file
+                    MegaClient.uploadFile(out, megaParent, new MegaClient.Progress() { public void bytes(long n) {} });
+                    out.delete();
+                    msg = "Created " + out.getName() + " in MEGA";
+                }
             } catch (Exception e) {
                 if (zo != null) try { zo.close(); } catch (IOException x) {}
                 if (pz != null) try { pz.close(); } catch (IOException x) {}
@@ -477,6 +501,10 @@ class ZipItem extends File {
         }}).start();
     }
 
+    static InputStream openIn(File f) throws IOException {
+        return f instanceof MegaItem ? ((MegaItem) f).openStream() : new FileInputStream(f);
+    }
+
     static void addZipEnc(PZipWriter w, File f, String entry, File skip) throws IOException {
         if (f.equals(skip)) return;
         if (f.isDirectory()) {
@@ -485,7 +513,7 @@ class ZipItem extends File {
             for (int i = 0; i < c.length; i++) addZipEnc(w, c[i], entry + "/" + c[i].getName(), skip);
         } else {
             InputStream in = null;
-            try { in = new FileInputStream(f); w.addFile(entry, f.lastModified(), in); }
+            try { in = openIn(f); w.addFile(entry, f.lastModified(), in); }
             finally { if (in != null) try { in.close(); } catch (IOException e) {} }
         }
     }
@@ -499,7 +527,7 @@ class ZipItem extends File {
         } else {
             InputStream in = null;
             try {
-                in = new FileInputStream(f); zo.putNextEntry(new ZipEntry(entry)); byte[] x = new byte[65536]; int n;
+                in = openIn(f); zo.putNextEntry(new ZipEntry(entry)); byte[] x = new byte[65536]; int n;
                 while ((n = in.read(x)) > 0) zo.write(x, 0, n); zo.closeEntry();
             } finally { if (in != null) try { in.close(); } catch (IOException e) {} }
         }
