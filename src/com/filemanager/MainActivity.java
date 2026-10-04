@@ -2403,10 +2403,6 @@ public class MainActivity extends Activity {
 			toast("Tap items in the tree to select them");
 			return;
 		}
-		if (a != 1 && a != 7 && hasMega(multi)) {
-			toast("MEGA is read-only: you can only copy files out of it");
-			return;
-		}
 		if (a == 1)
 			transferMulti(false);
 		else if (a == 2)
@@ -2427,11 +2423,8 @@ public class MainActivity extends Activity {
 			toast("Not available for several items");
 	}
 
+	/** copy or move into a MEGA folder: local items are uploaded, MEGA items are copied/moved inside MEGA */
 	void uploadToMega(ArrayList<File> srcs, MegaItem dst, boolean move) {
-		if (move) {
-			toast("Use Copy to upload to MEGA");
-			return;
-		}
 		if (dst.isRootNode()) {
 			toast("Open a MEGA folder (for example Cloud Drive) first");
 			return;
@@ -2440,17 +2433,22 @@ public class MainActivity extends Activity {
 			toast("Connect to MEGA first");
 			return;
 		}
-		ArrayList<File> ok = new ArrayList<File>();
+		ArrayList<File> local = new ArrayList<File>(), mega = new ArrayList<File>();
 		for (int i = 0; i < srcs.size(); i++) {
 			File s = srcs.get(i);
-			if (!(s instanceof MegaItem) && !(s instanceof ZipItem))
-				ok.add(s);
+			if (s instanceof MegaItem)
+				mega.add(s);
+			else if (!(s instanceof ZipItem))
+				local.add(s);
 		}
-		if (ok.isEmpty()) {
-			toast("Only files and folders on this device can be uploaded to MEGA");
+		if (local.isEmpty() && mega.isEmpty()) {
+			toast("Items inside a zip cannot be sent to MEGA directly. Extract them first");
 			return;
 		}
-		fileOperations.startUploadToMega(ok, dst);
+		if (!mega.isEmpty())
+			megaCopyMove(mega, dst, move);
+		if (!local.isEmpty())
+			fileOperations.startUploadToMega(local, dst, move);
 	}
 
 	void transferMulti(boolean move) {
@@ -2465,8 +2463,8 @@ public class MainActivity extends Activity {
 			uploadToMega(srcs, (MegaItem) dstDir, move);
 			return;
 		}
-		if (hasMega(srcs) && (move || dstDir instanceof ZipItem)) {
-			toast(move ? "MEGA is read-only: use Copy" : "Copy MEGA files into a normal folder first");
+		if (hasMega(srcs) && dstDir instanceof ZipItem) {
+			toast("Copy MEGA files into a normal folder first");
 			return;
 		}
 		if (dstDir instanceof ZipItem) {
@@ -2498,7 +2496,7 @@ public class MainActivity extends Activity {
 				continue;
 			}
 			
-			if (move && !(s instanceof ZipItem) && !dst.exists() && s.renameTo(dst)) {
+			if (move && !(s instanceof ZipItem) && !(s instanceof MegaItem) && !dst.exists() && s.renameTo(dst)) {
 				renamed++;
 				continue;
 			}
@@ -2524,16 +2522,37 @@ public class MainActivity extends Activity {
 		}
 		final ArrayList<ZipItem> zipEntries = new ArrayList<ZipItem>();
 		final ArrayList<File> normal = new ArrayList<File>();
+		final ArrayList<File> mega = new ArrayList<File>();
 		for (int i = 0; i < items.size(); i++) {
 			File f = items.get(i);
-			if (f instanceof ZipItem)
+			if (f instanceof MegaItem) {
+				if (!((MegaItem) f).isSystemNode())
+					mega.add(f);
+			} else if (f instanceof ZipItem)
 				zipEntries.add((ZipItem) f);
 			else
 				normal.add(f);
 		}
-		createDialog("Delete", "Delete " + items.size() + (items.size() == 1 ? " item?" : " items?"))
+		if (zipEntries.isEmpty() && normal.isEmpty() && mega.isEmpty()) {
+			toast("These MEGA folders cannot be deleted");
+			return;
+		}
+		boolean allPerm = !mega.isEmpty();
+		for (int i = 0; i < mega.size(); i++)
+			if (!MegaClient.inRubbish(((MegaItem) mega.get(i)).handle))
+				allPerm = false;
+		String msg = "Delete " + items.size() + (items.size() == 1 ? " item?" : " items?");
+		if (!mega.isEmpty())
+			msg += allPerm ? "\n\nItems in the MEGA Rubbish Bin are deleted permanently." : "\n\nMEGA items go to the MEGA Rubbish Bin.";
+		createDialog("Delete", msg)
 				.setPositiveButton("Delete", new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
+						if (!mega.isEmpty())
+							megaDelete(mega);
+						if (zipEntries.isEmpty() && normal.isEmpty()) {
+							selected = null;
+							return;
+						}
 						if (!zipEntries.isEmpty() && !normal.isEmpty()) {
 							exitMulti();
 							ZipItem.deleteZipEntriesThenFiles(
@@ -2560,7 +2579,7 @@ public class MainActivity extends Activity {
 	}
 
 	void tally(File f, long[] t) {
-		boolean link = !(f instanceof ZipItem) && isSymlink(f);
+		boolean link = !(f instanceof ZipItem) && !(f instanceof MegaItem) && isSymlink(f);
 		if (f.isDirectory() && !link) {
 			t[1]++;
 			File[] c = f.listFiles();
@@ -2597,16 +2616,24 @@ public class MainActivity extends Activity {
 
 	void duplicateMulti() {
 		ArrayList<File> items = multiItems();
-		ArrayList<File> s2 = new ArrayList<File>(), d2 = new ArrayList<File>();
+		ArrayList<File> s2 = new ArrayList<File>(), d2 = new ArrayList<File>(), mega = new ArrayList<File>();
 		for (int i = 0; i < items.size(); i++) {
 			File s = items.get(i);
+			if (s instanceof MegaItem) {
+				if (!((MegaItem) s).isSystemNode())
+					mega.add(s);
+				continue;
+			}
 			if (s instanceof ZipItem)
 				continue;
 			s2.add(s);
 			d2.add(uniqueSibling(s, "copy", null));
 		}
+		if (!mega.isEmpty())
+			megaDuplicate(mega);
 		if (s2.isEmpty()) {
-			toast("Nothing to duplicate");
+			if (mega.isEmpty())
+				toast("Nothing to duplicate");
 			return;
 		}
 		fileOperations.startTransfer(s2, d2, false, "Duplicating", "Duplicated", 0);
@@ -2624,11 +2651,76 @@ public class MainActivity extends Activity {
 
 	void shareMulti() {
 		ArrayList<File> items = multiItems();
+		final ArrayList<File> files = new ArrayList<File>();
+		final ArrayList<MegaItem> mega = new ArrayList<MegaItem>();
+		for (int i = 0; i < items.size(); i++) {
+			File s = items.get(i);
+			if (s instanceof MegaItem) {
+				if (s.isFile())
+					mega.add((MegaItem) s);
+				continue;
+			}
+			if (s instanceof ZipItem || !s.isFile())
+				continue;
+			files.add(s);
+		}
+		if (mega.isEmpty()) {
+			shareFilesNow(files);
+			return;
+		}
+		// MEGA files are downloaded into the cache first
+		final AlertDialog wait = busyDialog("Share", "Downloading from MEGA...");
+		new Thread(new Runnable() {
+			public void run() {
+				String err = null;
+				for (int i = 0; i < mega.size() && err == null; i++) {
+					MegaItem mi = mega.get(i);
+					File dir = new File(getCacheDir(), "mega/" + mi.handle + "_" + mi.lastModified());
+					File out = new File(dir, mi.getName());
+					try {
+						if (!(out.exists() && out.length() == mi.length())) {
+							dir.mkdirs();
+							File tmp = new File(dir, mi.getName() + ".part");
+							InputStream in = mi.openStream();
+							OutputStream os = new FileOutputStream(tmp);
+							try {
+								byte[] b = new byte[65536];
+								int n;
+								while ((n = in.read(b)) > 0)
+									os.write(b, 0, n);
+							} finally {
+								os.close();
+								in.close();
+							}
+							if (!tmp.renameTo(out))
+								throw new IOException("Cannot save the downloaded file");
+						}
+						files.add(out);
+					} catch (Exception e) {
+						err = e.getMessage() == null ? e.toString() : e.getMessage();
+					}
+				}
+				final String m = err;
+				runOnUiThread(new Runnable() {
+					public void run() {
+						try {
+							wait.dismiss();
+						} catch (Exception e) {
+						}
+						if (m != null)
+							toast("MEGA: " + m);
+						else
+							shareFilesNow(files);
+					}
+				});
+			}
+		}).start();
+	}
+
+	void shareFilesNow(ArrayList<File> items) {
 		ArrayList<Uri> uris = new ArrayList<Uri>();
 		for (int i = 0; i < items.size(); i++) {
 			File s = items.get(i);
-			if (s instanceof ZipItem || s instanceof MegaItem || !s.isFile())
-				continue;
 			uris.add(new Uri.Builder().scheme("content").authority(FileShareProvider.AUTH).path(s.getAbsolutePath())
 					.build());
 		}
@@ -2652,7 +2744,7 @@ public class MainActivity extends Activity {
 			toast("Cannot share: " + e.getMessage());
 		}
 	}
-	
+
 	void action(int a) {
 		if (a == 6) {
 			if (multiMode || !multi.isEmpty()) {
@@ -2683,6 +2775,10 @@ public class MainActivity extends Activity {
 			File base = selectedLeft ? leftCur : rightCur;
 			if (base instanceof ZipItem) {
 				toast("Zip contents are read-only");
+				return;
+			}
+			if (base instanceof MegaItem) {
+				megaNewText((MegaItem) base);
 				return;
 			}
 			File nf = uniqueFile(base, "untitled", ".txt");
@@ -2902,11 +2998,25 @@ public class MainActivity extends Activity {
 		final ArrayList<String> icons = new ArrayList<String>();
 		final ArrayList<Integer> codes = new ArrayList<Integer>();
 		if (f instanceof MegaItem) {
+			boolean sys = ((MegaItem) f).isSystemNode();
 			addItem(labels, icons, codes, "\uD83D\uDC41\uFE0F", "Open", 11);
-			if (!f.isDirectory())
+			if (!f.isDirectory()) {
 				addItem(labels, icons, codes, "\u2197\uFE0F", "Open with", 12);
-			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy (download)", 1);
+				addItem(labels, icons, codes, "\uD83D\uDCE4", "Share", 13);
+			}
+			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
+			if (!sys) {
+				addItem(labels, icons, codes, "\u2722", "Move", 2);
+				addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
+			}
+			addItem(labels, icons, codes, "\uD83D\uDCC1", "New folder", 4);
+			addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
+			if (!sys)
+				addItem(labels, icons, codes, "\u274C", "Delete", 5);
 			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
+			if (!sys)
+				addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
+			addItem(labels, icons, codes, "\uD83D\uDCE6", "Zip", 9);
 			createDialog(f.getName(), null).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
 				public void onClick(DialogInterface d, int which) {
 					action(codes.get(which).intValue());
@@ -3348,14 +3458,48 @@ public class MainActivity extends Activity {
 
 	void megaAction(int a) {
 		final MegaItem mi = (MegaItem) selected;
+		boolean sys = mi.isSystemNode();
 		if (a == 1) {
 			transfer(false);
 			return;
 		}
+		if (a == 2) {
+			if (sys)
+				toast("This MEGA folder cannot be moved");
+			else
+				transfer(true);
+			return;
+		}
+		if (a == 3) {
+			if (sys)
+				toast("This MEGA folder cannot be renamed");
+			else
+				ask("Rename", "New name", 3);
+			return;
+		}
+		if (a == 5) {
+			if (sys)
+				toast("This MEGA folder cannot be deleted");
+			else
+				delConfirm();
+			return;
+		}
 		if (a == 7) {
-			showMessageDialog(mi.getName(), "In MEGA\nType: " + (mi.isDirectory() ? "Folder" : "File")
+			showMessageDialog(mi.getName(), "In MEGA" + (MegaClient.inRubbish(mi.handle) ? " (Rubbish Bin)" : "") + "\nType: "
+					+ (mi.isDirectory() ? "Folder" : "File")
 					+ (mi.isDirectory() ? "" : "\nSize: " + human(mi.length())) + "\nModified: "
-					+ (new Date(mi.lastModified())) + "\nRead-only");
+					+ (new Date(mi.lastModified())));
+			return;
+		}
+		if (a == 8) {
+			if (sys)
+				toast("This MEGA folder cannot be duplicated");
+			else
+				duplicate();
+			return;
+		}
+		if (a == 9) {
+			ZipItem.zip(this);
 			return;
 		}
 		if (a == 11 || a == 12) {
@@ -3376,7 +3520,237 @@ public class MainActivity extends Activity {
 				});
 			return;
 		}
-		toast("MEGA is read-only: you can open files and copy them out");
+		toast("Not available for MEGA items");
+	}
+
+	// ---- MEGA changes: they run in the background with a small waiting dialog ----
+	interface MegaWork {
+		String run() throws Exception;
+	}
+
+	void megaTask(String title, final MegaWork w) {
+		final AlertDialog wait = busyDialog("MEGA", title + "...");
+		new Thread(new Runnable() {
+			public void run() {
+				String msg;
+				try {
+					msg = w.run();
+				} catch (Exception e) {
+					msg = "MEGA: " + (e.getMessage() == null ? e.toString() : e.getMessage());
+				}
+				final String m = msg;
+				runOnUiThread(new Runnable() {
+					public void run() {
+						try {
+							wait.dismiss();
+						} catch (Exception e) {
+						}
+						selected = null;
+						exitMulti();
+						listCache.clear();
+						refresh();
+						toast(m);
+					}
+				});
+			}
+		}).start();
+	}
+
+	boolean megaBase(MegaItem base) {
+		if (base.isRootNode()) {
+			toast("Open a MEGA folder (for example Cloud Drive) first");
+			return false;
+		}
+		if (!MegaClient.isReady()) {
+			toast("Connect to MEGA first");
+			return false;
+		}
+		return true;
+	}
+
+	void megaRename(final MegaItem mi, final String n) {
+		if (n.indexOf('/') >= 0) {
+			toast("Invalid name");
+			return;
+		}
+		MegaClient.Node node = MegaClient.node(mi.handle);
+		if (node == null)
+			return;
+		String ex = MegaClient.child(node.p, n, mi.isDirectory());
+		if (ex != null && !ex.equals(mi.handle)) {
+			toast("Already exists");
+			return;
+		}
+		megaTask("Renaming", new MegaWork() {
+			public String run() throws Exception {
+				MegaClient.rename(mi.handle, n);
+				return "Renamed";
+			}
+		});
+	}
+
+	void megaNewFolder(final MegaItem base, final String n) {
+		if (!megaBase(base))
+			return;
+		if (n.indexOf('/') >= 0) {
+			toast("Invalid name");
+			return;
+		}
+		if (MegaClient.child(base.handle, n, true) != null || MegaClient.child(base.handle, n, false) != null) {
+			toast("Already exists");
+			return;
+		}
+		(selectedLeft ? leftOpen : rightOpen).add(base.getAbsolutePath());
+		megaTask("Creating folder", new MegaWork() {
+			public String run() throws Exception {
+				MegaClient.makeFolder(n, base.handle);
+				return "Folder created";
+			}
+		});
+	}
+
+	void megaNewText(final MegaItem base) {
+		if (!megaBase(base))
+			return;
+		(selectedLeft ? leftOpen : rightOpen).add(base.getAbsolutePath());
+		megaTask("Creating file", new MegaWork() {
+			public String run() throws Exception {
+				String name = MegaClient.freeName(base.handle, "untitled", ".txt");
+				File dir = new File(getCacheDir(), "mega-new");
+				dir.mkdirs();
+				File f = new File(dir, name);
+				new FileOutputStream(f).close();
+				MegaClient.Progress none = new MegaClient.Progress() {
+					public void bytes(long n) {
+					}
+				};
+				try {
+					try {
+						MegaClient.uploadFile(f, base.handle, none);
+					} catch (IOException e) {
+						// in case the server refuses an empty upload, put a single line break in the file
+						FileOutputStream os = new FileOutputStream(f);
+						os.write('\n');
+						os.close();
+						MegaClient.uploadFile(f, base.handle, none);
+					}
+				} finally {
+					f.delete();
+				}
+				return "Created " + name;
+			}
+		});
+	}
+
+	void megaDelete(final ArrayList<File> items) {
+		megaTask("Deleting", new MegaWork() {
+			public String run() throws Exception {
+				int n = 0, perm = 0;
+				for (int i = 0; i < items.size(); i++) {
+					if (!(items.get(i) instanceof MegaItem))
+						continue;
+					String h = ((MegaItem) items.get(i)).handle;
+					boolean covered = false; // already inside another selected folder
+					for (int j = 0; j < items.size(); j++)
+						if (j != i && items.get(j) instanceof MegaItem && MegaClient.isInside(h, ((MegaItem) items.get(j)).handle))
+							covered = true;
+					if (covered || MegaClient.node(h) == null)
+						continue;
+					if (MegaClient.inRubbish(h))
+						perm++;
+					MegaClient.trashOrDelete(h);
+					n++;
+				}
+				if (n > 0 && perm == n)
+					return "Deleted " + n + (n == 1 ? " item" : " items");
+				return "Moved " + n + (n == 1 ? " item" : " items") + " to the MEGA Rubbish Bin";
+			}
+		});
+	}
+
+	void megaDuplicate(final ArrayList<File> items) {
+		megaTask("Duplicating", new MegaWork() {
+			public String run() throws Exception {
+				int n = 0;
+				for (int i = 0; i < items.size(); i++) {
+					if (!(items.get(i) instanceof MegaItem))
+						continue;
+					MegaClient.Node node = MegaClient.node(((MegaItem) items.get(i)).handle);
+					if (node == null || node.t >= 2)
+						continue;
+					MegaClient.copyTree(node.h, node.p, MegaClient.copyName(node.p, node.name, node.t != 0));
+					n++;
+				}
+				return "Duplicated " + n + (n == 1 ? " item" : " items");
+			}
+		});
+	}
+
+	/** copies or moves MEGA items into a MEGA folder; nothing is downloaded */
+	void megaCopyMove(final ArrayList<File> srcs, final MegaItem dst, final boolean move) {
+		if (!megaBase(dst))
+			return;
+		megaTask(move ? "Moving" : "Copying", new MegaWork() {
+			public String run() throws Exception {
+				int[] st = new int[3]; // done, skipped, refused
+				for (int i = 0; i < srcs.size(); i++) {
+					if (!(srcs.get(i) instanceof MegaItem))
+						continue;
+					MegaItem s = (MegaItem) srcs.get(i);
+					if (s.isSystemNode() || MegaClient.node(s.handle) == null) {
+						st[2]++;
+						continue;
+					}
+					if (MegaClient.isInside(dst.handle, s.handle)) {
+						st[2]++; // into itself
+						continue;
+					}
+					megaCopyInto(s.handle, dst.handle, move, st);
+				}
+				String verb = move ? "Moved " : "Copied ";
+				return verb + st[0] + (st[0] == 1 ? " item" : " items") + (st[1] > 0 ? ", skipped " + st[1] + " already there" : "")
+						+ (st[2] > 0 ? ", " + st[2] + " not possible (into itself or protected)" : "");
+			}
+		});
+	}
+
+	void megaCopyInto(String srcH, String dstParent, boolean move, int[] st) throws IOException {
+		MegaClient.Node n = MegaClient.node(srcH);
+		if (n == null)
+			return;
+		boolean folder = n.t != 0;
+		String existing = MegaClient.child(dstParent, n.name, folder);
+		if (move && n.p.equals(dstParent)) {
+			st[1]++;
+			return;
+		}
+		if (!folder) {
+			if (existing != null) {
+				st[1]++;
+				return;
+			}
+			if (move)
+				MegaClient.move(srcH, dstParent);
+			else
+				MegaClient.copyFileTo(srcH, dstParent, n.name);
+			st[0]++;
+			return;
+		}
+		if (existing == null) {
+			if (move) {
+				MegaClient.move(srcH, dstParent);
+			} else {
+				MegaClient.copyTree(srcH, dstParent, n.name);
+			}
+			st[0]++;
+			return;
+		}
+		// the folder exists already: merge the content
+		ArrayList<String> k = MegaClient.kidsOf(srcH);
+		for (int i = 0; i < k.size(); i++)
+			megaCopyInto(k.get(i), existing, move, st);
+		if (move && MegaClient.kidsOf(srcH).isEmpty())
+			MegaClient.trashOrDelete(srcH);
 	}
 
 	void previewFile(final File f) {
@@ -3460,6 +3834,10 @@ public class MainActivity extends Activity {
 	}
 
 	void duplicate() {
+		if (selected instanceof MegaItem) {
+			megaDuplicate(one(selected));
+			return;
+		}
 		File dst = uniqueSibling(selected, "copy", null);
 		startTransfer(selected, dst, false, "Duplicating", "Duplicated");
 	}
@@ -3476,8 +3854,8 @@ public class MainActivity extends Activity {
 			uploadToMega(one(src), (MegaItem) dstDir, move);
 			return;
 		}
-		if (src instanceof MegaItem && (move || dstDir instanceof ZipItem)) {
-			toast(move ? "MEGA is read-only: use Copy" : "Copy MEGA files into a normal folder first");
+		if (src instanceof MegaItem && dstDir instanceof ZipItem) {
+			toast("Copy MEGA files into a normal folder first");
 			return;
 		}
 		if (dstDir instanceof ZipItem) {
@@ -3505,7 +3883,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		
-		if (move && !(src instanceof ZipItem) && !dst.exists() && src.renameTo(dst)) {
+		if (move && !(src instanceof ZipItem) && !(src instanceof MegaItem) && !dst.exists() && src.renameTo(dst)) {
 			selected = null;
 			refresh();
 			toast("Moved");
@@ -3543,6 +3921,10 @@ public class MainActivity extends Activity {
 							return;
 						if (a == 4) {
 							File base = selectedLeft ? leftCur : rightCur;
+							if (base instanceof MegaItem) {
+								megaNewFolder((MegaItem) base, n);
+								return;
+							}
 							File nf = new File(base, n);
 							if (nf.exists())
 								toast("Already exists");
@@ -3550,6 +3932,9 @@ public class MainActivity extends Activity {
 								toast(nf.mkdir() ? "Folder created" : "Create failed");
 							HashSet<String> op = selectedLeft ? leftOpen : rightOpen;
 							op.add(base.getAbsolutePath());
+						} else if (selected instanceof MegaItem) {
+							megaRename((MegaItem) selected, n);
+							return;
 						} else if (selected instanceof ZipItem) {
 							ZipItem zi = (ZipItem) selected;
 							if (n.indexOf('/') >= 0) {
@@ -3575,6 +3960,18 @@ public class MainActivity extends Activity {
 	}
 
 	void delConfirm() {
+		if (selected instanceof MegaItem) {
+			final MegaItem mi = (MegaItem) selected;
+			boolean perm = MegaClient.inRubbish(mi.handle);
+			createDialog("Delete", (perm ? "Delete permanently: " : "Move to the MEGA Rubbish Bin: ") + mi.getName() + "?")
+					.setPositiveButton("Delete", new DialogInterface.OnClickListener() {
+						public void onClick(DialogInterface d, int w) {
+							selected = null;
+							megaDelete(one(mi));
+						}
+					}).setNegativeButton("Cancel", null).show();
+			return;
+		}
 		createDialog("Delete", (selected instanceof ZipItem ? "Delete " : "Move to trash: ") + selected.getName() + "?")
 				.setPositiveButton("Delete", new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
