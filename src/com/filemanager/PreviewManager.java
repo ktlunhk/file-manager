@@ -245,8 +245,8 @@ class PreviewManager {
 						csvColumn.setOrientation(LinearLayout.VERTICAL);
 						csvColumn.setBackgroundColor(activity.colSurface);
 
-						List<TextView> cells = new ArrayList<TextView>();
-						int[] widths = getCsvColumnWidths(rowsF);
+						final List<TextView> cells = new ArrayList<TextView>();
+						final int[] widths = getCsvColumnWidths(rowsF);
 						TableLayout header = buildCsvTable(rowsF, 0, 1, cells, widths, true);
 						csvColumn.addView(header, new LinearLayout.LayoutParams(-2, -2));
 
@@ -258,13 +258,46 @@ class PreviewManager {
 						csvColumn.addView(vScroll, bodyLp);
 
 						hScroll.addView(csvColumn, new HorizontalScrollView.LayoutParams(-2, -1));
-						ZoomTextContainer zoomWrap = new ZoomTextContainer(activity, cells);
+						final ZoomTextContainer zoomWrap = new ZoomTextContainer(activity, cells);
+						// column widths follow the text size, so zooming in never cuts figures down to "5..."
+						fitCsvColumns(cells, widths.length, zoomWrap.textSp);
+						zoomWrap.afterZoom = new Runnable() {
+							public void run() {
+								fitCsvColumns(cells, widths.length, zoomWrap.textSp);
+							}
+						};
 						zoomWrap.addView(hScroll, new FrameLayout.LayoutParams(-1, -1));
 						holder.addView(zoomWrap, new FrameLayout.LayoutParams(-1, -1));
 					}
 				});
 			}
 		}).start();
+	}
+
+	/** sizes every column to its widest cell at the current text size (cells are stored row by row, cols per row) */
+	void fitCsvColumns(List<TextView> cells, int cols, float sp) {
+		if (cols <= 0 || cells.isEmpty())
+			return;
+		int[] w = new int[cols];
+		int pad = 28 * activity.dp; // 12dp padding each side + a little slack
+		int min = 40 * activity.dp;
+		int cap = Math.round(240 * activity.dp * Math.max(1f, sp / 12f));
+		for (int i = 0; i < cells.size(); i++) {
+			TextView t = cells.get(i);
+			int need = (int) Math.ceil(t.getPaint().measureText(t.getText().toString())) + pad;
+			if (need > w[i % cols])
+				w[i % cols] = need;
+		}
+		for (int c = 0; c < cols; c++)
+			w[c] = Math.max(min, Math.min(w[c], cap));
+		for (int i = 0; i < cells.size(); i++) {
+			TextView t = cells.get(i);
+			ViewGroup.LayoutParams lp = t.getLayoutParams();
+			if (lp != null && lp.width != w[i % cols]) {
+				lp.width = w[i % cols];
+				t.setLayoutParams(lp);
+			}
+		}
 	}
 
 	int[] getCsvColumnWidths(List<String[]> rows) {
@@ -910,6 +943,7 @@ class PreviewManager {
 		float textSp = 12f;
 		float pending = 1f; // live pinch factor, applied as a cheap view transform until the fingers lift
 		final List<TextView> targets;
+		Runnable afterZoom; // called after the text size changed (the CSV table re-fits its column widths here)
 		static final float MIN_SP = 8f, MAX_SP = 28f;
 
 		ZoomTextContainer(Context c, final List<TextView> scalables) {
@@ -981,6 +1015,8 @@ class PreviewManager {
 			}
 			for (TextView tv : targets)
 				tv.setTextSize(textSp);
+			if (afterZoom != null)
+				afterZoom.run();
 			// keep the content under the fingers in place after the relayout
 			post(new Runnable() {
 				public void run() {
