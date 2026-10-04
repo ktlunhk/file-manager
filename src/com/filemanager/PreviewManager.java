@@ -53,6 +53,10 @@ class PreviewManager {
     }
 
     void preview(final File file) {
+        if (file instanceof MegaItem) {
+            activity.megaFetch((MegaItem) file, new MegaItem.Done() { public void done(File f) { preview(f); } });
+            return;
+        }
         if (file instanceof ZipItem) { previewZipEntry((ZipItem) file); return; }
         String name = file.getName();
         if (isImageFile(name)) showImagePreview(file);
