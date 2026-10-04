@@ -393,8 +393,9 @@ class ZipItem extends File {
     static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final String megaParent) {
         android.widget.LinearLayout box = new android.widget.LinearLayout(a);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
-        box.setPadding(20 * a.dp, 8 * a.dp, 20 * a.dp, 0);
+        a.padDialogBox(box);
         final android.widget.EditText pw = new android.widget.EditText(a);
+        a.alignInput(pw);
         pw.setHint("Password (leave empty for none)");
         pw.setSingleLine(true);
         pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
@@ -431,11 +432,12 @@ class ZipItem extends File {
 
     static void askPassword(final MainActivity a, final File cf, final Runnable ok, boolean wrong) {
         final android.widget.EditText pw = new android.widget.EditText(a);
+        a.alignInput(pw);
         pw.setHint("Password");
         pw.setSingleLine(true);
         pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
         android.widget.FrameLayout box = new android.widget.FrameLayout(a);
-        box.setPadding(20 * a.dp, 8 * a.dp, 20 * a.dp, 0);
+        a.padDialogBox(box);
         box.addView(pw, new android.widget.FrameLayout.LayoutParams(-1, -2));
         a.createDialog("Password required", cf.getName() + (wrong ? "\nWrong password, try again." : "")).setView(box)
             .setPositiveButton("Open", new android.content.DialogInterface.OnClickListener() {
