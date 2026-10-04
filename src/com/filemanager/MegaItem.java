@@ -3,7 +3,7 @@ package com.filemanager;
 import java.io.*;
 import java.util.*;
 
-/** A file or folder in the user's MEGA cloud, shown in the tree like a local item (read-only). */
+/** A file or folder in the user's MEGA cloud, shown in the tree like a local item . */
 class MegaItem extends File {
 	interface Done {
 		void done(File f);
@@ -34,6 +34,14 @@ class MegaItem extends File {
 
 	static MegaItem root() {
 		return new MegaItem("");
+	}
+
+	/** the virtual MEGA root, Cloud Drive, Inbox and Rubbish Bin: they cannot be renamed, moved or deleted */
+	boolean isSystemNode() {
+		if (isRootNode())
+			return true;
+		MegaClient.Node n = n();
+		return n != null && n.t >= 2;
 	}
 
 	boolean isRootNode() {
