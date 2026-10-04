@@ -186,9 +186,9 @@ class DexItem extends ZipItem {
 	}
 
 	static byte[] readEntry(File apk,String entry)throws IOException{
-		ZipFile zf=null; InputStream in=null;
+		PZip zf=null; InputStream in=null;
 		try{
-			zf=new ZipFile(apk); ZipEntry ze=zf.getEntry(entry); if(ze==null)return new byte[0];
+			zf=new PZip(apk); PEntry ze=zf.getEntry(entry); if(ze==null)return new byte[0];
 			in=zf.getInputStream(ze); ByteArrayOutputStream b=new ByteArrayOutputStream();
 			byte[] x=new byte[65536]; int n; while((n=in.read(x))>0)b.write(x,0,n); return b.toByteArray();
 		}finally{
