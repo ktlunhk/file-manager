@@ -25,6 +25,126 @@ class FileOperations {
         j.start();
     }
 
+    void startUploadToMega(ArrayList<File> srcs, MegaItem dstDir) {
+        new MegaUpJob(srcs, dstDir.handle).start();
+    }
+
+    class MegaUpJob {
+        final ArrayList<File> srcs;
+        final String parent;
+        volatile boolean cancelled;
+        volatile long done, total;
+        volatile String cur = "Preparing...";
+        int uploaded, skipped;
+        long lastUi;
+        OperationProgress operationProgress;
+        final Runnable updater;
+
+        MegaUpJob(ArrayList<File> srcs, String parent) {
+            this.srcs = srcs;
+            this.parent = parent;
+            updater = new Runnable() {
+                public void run() {
+                    if (operationProgress == null) return;
+                    int pct = total > 0 ? (int) Math.min(1000L, Math.max(0L, done) * 1000L / total) : 0;
+                    operationProgress.update(cur, Math.max(0L, done), total, (pct / 10) + "%   " + activity.human(Math.max(0L, done)) + " / " + activity.human(total));
+                }
+            };
+        }
+
+        void tick(boolean force) {
+            long now = System.currentTimeMillis();
+            if (!force && now - lastUi < 100) return;
+            lastUi = now;
+            activity.runOnUiThread(updater);
+        }
+
+        long sizeOf(File f) throws IOException {
+            if (cancelled) throw new InterruptedIOException("Cancelled");
+            if (f.isDirectory()) {
+                long t = 0;
+                File[] c = f.listFiles();
+                if (c != null) for (int i = 0; i < c.length; i++) t += sizeOf(c[i]);
+                return t;
+            }
+            return Math.max(f.length(), 0L);
+        }
+
+        void start() {
+            operationProgress = new OperationProgress(activity, "Uploading to MEGA", true, true, activity.dp, new Runnable() {
+                public void run() {
+                    cancelled = true;
+                    cur = "Cancelling...";
+                }
+            });
+            updater.run();
+            new Thread(new Runnable() {
+                public void run() {
+                    String err = null;
+                    try {
+                        for (int i = 0; i < srcs.size(); i++) total += sizeOf(srcs.get(i));
+                        tick(true);
+                        for (int i = 0; i < srcs.size(); i++) upload(srcs.get(i), parent);
+                    } catch (InterruptedIOException e) {
+                        cancelled = true;
+                    } catch (Exception e) {
+                        err = e.getMessage() == null ? e.toString() : e.getMessage();
+                    }
+                    finish(err);
+                }
+            }).start();
+        }
+
+        void upload(File f, String parentHandle) throws IOException {
+            if (cancelled) throw new InterruptedIOException("Cancelled");
+            String name = f.getName();
+            if (f.isDirectory()) {
+                String h = MegaClient.child(parentHandle, name, true);
+                if (h == null) h = MegaClient.makeFolder(name, parentHandle);
+                File[] c = f.listFiles();
+                if (c != null) for (int i = 0; i < c.length; i++) upload(c[i], h);
+                return;
+            }
+            if (MegaClient.child(parentHandle, name, false) != null) {
+                skipped++;
+                done += Math.max(f.length(), 0L);
+                tick(false);
+                return;
+            }
+            cur = name;
+            tick(true);
+            MegaClient.uploadFile(f, parentHandle, new MegaClient.Progress() {
+                public void bytes(long n) throws IOException {
+                    if (cancelled) throw new InterruptedIOException("Cancelled");
+                    done += n;
+                    tick(false);
+                }
+            });
+            uploaded++;
+        }
+
+        void finish(final String err) {
+            activity.runOnUiThread(new Runnable() {
+                public void run() {
+                    try {
+                        if (operationProgress != null) operationProgress.dismiss();
+                    } catch (Exception e) {
+                    }
+                    String msg;
+                    if (err != null) msg = "Error: " + err;
+                    else if (cancelled) msg = "Cancelled";
+                    else msg = "Uploaded " + uploaded + (uploaded == 1 ? " file" : " files")
+                            + (skipped > 0 ? ", skipped " + skipped + " already in MEGA" : "");
+                    activity.selected = null;
+                    activity.exitMulti();
+                    activity.listCache.clear();
+                    activity.refresh();
+                    activity.toast(msg);
+                }
+            });
+        }
+    }
+
     void startTransferToZip(ArrayList<File> srcs, boolean move, String title, String verb, ZipItem dstZip) {
         Job j = new Job(srcs, new ArrayList<File>(), move, title, verb);
         j.dstZip = dstZip;
@@ -235,7 +355,7 @@ class FileOperations {
 				if (c != null)
 					for (int i = 0; i < c.length; i++)
 						copyNode(c[i], new File(d, c[i].getName()));
-				if (move && !(s instanceof ZipItem)) {
+				if (move && !(s instanceof ZipItem) && !(s instanceof MegaItem)) {
 					File[] left = s.listFiles();
 					if (left != null && left.length == 0)
 						s.delete();
@@ -260,7 +380,7 @@ class FileOperations {
 			tick(true);
 			copyData(s, d, over);
 			copied++;
-			if (move && !(s instanceof ZipItem)) {
+			if (move && !(s instanceof ZipItem) && !(s instanceof MegaItem)) {
 				if (!s.delete())
 					moveFail++;
 			}
@@ -271,17 +391,19 @@ class FileOperations {
 			File target = over ? new File(d.getParentFile(), d.getName() + ".dfm-part") : d;
 			InputStream in = null;
 			OutputStream out = null;
-			ZipFile zf = null;
+			PZip zf = null;
 			boolean ok = false;
 			try {
 				if (s instanceof ZipItem) {
 					ZipItem zi = (ZipItem) s;
-					zf = new ZipFile(zi.zip);
-					ZipEntry ze = zf.getEntry(zi.entry);
+					zf = new PZip(zi.zip);
+					PEntry ze = zf.getEntry(zi.entry);
 					if (ze == null)
 						throw new IOException("Entry not found: " + zi.entry);
 					in = zf.getInputStream(ze);
-				} else
+				} else if (s instanceof MegaItem)
+					in = ((MegaItem) s).openStream();
+				else
 					in = new FileInputStream(s);
 				out = new FileOutputStream(target);
 				byte[] buf = new byte[65536];
@@ -439,11 +561,13 @@ class FileOperations {
 			HashMap<String, long[]> exist = new HashMap<String, long[]>();
 			HashSet<String> dirSet = new HashSet<String>();
 			long oldTotal = 0, newTotal = 0;
-			ZipFile zf0 = new ZipFile(zip);
+			if (PZip.needsPassword(zip))
+				throw new IOException("Adding to a password-protected zip is not supported");
+			PZip zf0 = new PZip(zip);
 			try {
-				Enumeration<? extends ZipEntry> en = zf0.entries();
+				Enumeration<PEntry> en = zf0.entries();
 				while (en.hasMoreElements()) {
-					ZipEntry ze = en.nextElement();
+					PEntry ze = en.nextElement();
 					String n = ze.getName();
 					exist.put(n, new long[]{ze.getSize(), ze.getTime()});
 					oldTotal += Math.max(ze.getSize(), 0L);
@@ -499,19 +623,19 @@ class FileOperations {
 					drop.add(items.get(i).name);
 
 			File tmp = new File(zip.getParentFile(), zip.getName() + ".dfm-tmp");
-			ZipFile zf = null;
+			PZip zf = null;
 			ZipOutputStream zo = null;
 			boolean ok = false;
 			try {
-				zf = new ZipFile(zip);
+				zf = new PZip(zip);
 				zo = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)));
 				cur = "Rewriting " + zip.getName() + "...";
 				tick(true);
-				Enumeration<? extends ZipEntry> en = zf.entries();
+				Enumeration<PEntry> en = zf.entries();
 				while (en.hasMoreElements()) {
 					if (cancelled)
 						throw new InterruptedIOException("Cancelled");
-					ZipEntry ze = en.nextElement();
+					PEntry ze = en.nextElement();
 					String name = ze.getName();
 					if (drop.contains(name))
 						continue;
@@ -552,12 +676,12 @@ class FileOperations {
 					tick(true);
 					zo.putNextEntry(ne);
 					InputStream in = null;
-					ZipFile sz = null;
+					PZip sz = null;
 					try {
 						if (it.s instanceof ZipItem) {
 							ZipItem zi = (ZipItem) it.s;
-							sz = new ZipFile(zi.zip);
-							ZipEntry se = sz.getEntry(zi.entry);
+							sz = new PZip(zi.zip);
+							PEntry se = sz.getEntry(zi.entry);
 							if (se == null)
 								throw new IOException("Entry not found: " + zi.entry);
 							in = sz.getInputStream(se);
