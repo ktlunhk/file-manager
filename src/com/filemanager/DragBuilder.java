@@ -9,6 +9,8 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.ListAdapter;
+import android.widget.ListView;
 
 /** AlertDialog.Builder whose dialogs can be moved by dragging them (title, message or any empty area). */
 class DragBuilder extends AlertDialog.Builder {
@@ -31,6 +33,7 @@ class DragBuilder extends AlertDialog.Builder {
 		if (w == null)
 			return;
 		w.setGravity(Gravity.CENTER);
+		shrinkMenu(d, w);
 		View content = w.getDecorView().findViewById(android.R.id.content);
 		if (content == null)
 			content = w.getDecorView();
@@ -68,5 +71,40 @@ class DragBuilder extends AlertDialog.Builder {
 				return a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL;
 			}
 		});
+	}
+
+	/** menu dialogs (list of items): fit the width to the title and the widest item instead of the fixed wide dialog */
+	static void shrinkMenu(AlertDialog d, Window w) {
+		try {
+			View lvView = w.getDecorView().findViewById(android.R.id.list);
+			if (!(lvView instanceof ListView))
+				return;
+			ListView lv = (ListView) lvView;
+			ListAdapter ad = lv.getAdapter();
+			if (ad == null || ad.getCount() == 0)
+				return;
+			DisplayMetrics dm = d.getContext().getResources().getDisplayMetrics();
+			float density = dm.density;
+			int unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+			int widest = 0;
+			for (int i = 0; i < ad.getCount(); i++) {
+				View row = ad.getView(i, null, lv);
+				row.measure(unspec, unspec);
+				widest = Math.max(widest, row.getMeasuredWidth());
+			}
+			widest = widest + lv.getPaddingLeft() + lv.getPaddingRight() + (int) (16 * density);
+			int titleId = d.getContext().getResources().getIdentifier("alertTitle", "id", "android");
+			if (titleId != 0) {
+				View title = w.getDecorView().findViewById(titleId);
+				if (title != null) {
+					title.measure(unspec, unspec);
+					widest = Math.max(widest, title.getMeasuredWidth() + (int) (48 * density));
+				}
+			}
+			int maxW = (int) (dm.widthPixels * 0.9f);
+			int minW = (int) (240 * density);
+			w.setLayout(Math.max(minW, Math.min(maxW, widest)), WindowManager.LayoutParams.WRAP_CONTENT);
+		} catch (Exception ex) {
+		}
 	}
 }
