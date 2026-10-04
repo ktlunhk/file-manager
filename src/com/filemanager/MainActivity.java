@@ -3,6 +3,7 @@ package com.filemanager;
 import android.app.*;
 import android.os.*;
 import android.content.*;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.provider.Settings;
@@ -39,6 +40,8 @@ public class MainActivity extends Activity {
 	int leftSort = SORT_NAME, rightSort = SORT_NAME;
 	boolean leftSortRev, rightSortRev;
 	boolean showHidden = false;
+	LinearLayout bodyRef;
+	LinearLayout.LayoutParams leftLpRef, rightLpRef;
 	float splitWeight = 1f; 
 	static final int THEME_SYSTEM = 0, THEME_LIGHT = 1, THEME_DARK = 2;
 	int themeMode = THEME_SYSTEM;
@@ -170,6 +173,7 @@ public class MainActivity extends Activity {
 
 	public void onCreate(Bundle b) {
 		super.onCreate(b);
+		ZipItem.cacheDir = getCacheDir();
 		fileOperations = new FileOperations(this);
 		if (Build.VERSION.SDK_INT >= 30) {
 		
@@ -177,6 +181,7 @@ public class MainActivity extends Activity {
 		}
 		dp = (int) getResources().getDisplayMetrics().density;
 		prefs = getSharedPreferences("dfm", MODE_PRIVATE);
+		MegaClient.restore(prefs);
 		leftRoot = Environment.getExternalStorageDirectory();
 		rightRoot = Environment.getExternalStorageDirectory();
 		leftCur = leftRoot;
@@ -184,6 +189,9 @@ public class MainActivity extends Activity {
 		
 		leftOpen.add(leftRoot.getAbsolutePath());
 		rightOpen.add(rightRoot.getAbsolutePath());
+		registerStorageReceiver();
+		volCache = storageVolumes();
+		volSig = volSignature(volCache);
 		loadState();
 		computeTheme();
 		makeUi();
@@ -256,7 +264,269 @@ public class MainActivity extends Activity {
 
 	protected void onPause() {
 		super.onPause();
+		volHandler.removeCallbacks(volPoll);
 		saveState();
+	}
+
+	protected void onDestroy() {
+		try {
+			unregisterReceiver(storageReceiver);
+		} catch (Exception e) {
+		}
+		super.onDestroy();
+	}
+
+	// ---------- USB OTG / SD card support ----------
+	static class VolInfo {
+		String label;
+		File dir;
+		boolean removable;
+	}
+
+	BroadcastReceiver storageReceiver = new BroadcastReceiver() {
+		public void onReceive(Context c, Intent i) {
+			pollVolumes();
+		}
+	};
+
+	// ---- automatic drive detection (broadcast + 3 second poll, because USB OTG often sends no broadcast) ----
+	ArrayList<VolInfo> volCache = new ArrayList<VolInfo>();
+	String volSig = "";
+	boolean volScanning = false;
+	Handler volHandler = new Handler();
+	Runnable volPoll = new Runnable() {
+		public void run() {
+			pollVolumes();
+			volHandler.postDelayed(this, 3000);
+		}
+	};
+
+	String volSignature(ArrayList<VolInfo> l) {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < l.size(); i++)
+			sb.append(l.get(i).dir.getAbsolutePath()).append('|').append(l.get(i).label).append(';');
+		return sb.toString();
+	}
+
+	void pollVolumes() {
+		if (volScanning)
+			return;
+		volScanning = true;
+		new Thread(new Runnable() {
+			public void run() {
+				final ArrayList<VolInfo> nv = storageVolumes();
+				runOnUiThread(new Runnable() {
+					public void run() {
+						volScanning = false;
+						applyVolumes(nv);
+					}
+				});
+			}
+		}).start();
+	}
+
+	void applyVolumes(ArrayList<VolInfo> nv) {
+		String sig = volSignature(nv);
+		if (sig.equals(volSig))
+			return;
+		ArrayList<VolInfo> old = volCache;
+		volCache = nv;
+		volSig = sig;
+		for (int i = 0; i < old.size(); i++) {
+			boolean still = false;
+			for (int k = 0; k < nv.size(); k++)
+				if (nv.get(k).dir.equals(old.get(i).dir))
+					still = true;
+			if (!still && old.get(i).removable) {
+				dropPath(old.get(i).dir.getAbsolutePath());
+				toast("Drive removed: " + old.get(i).label);
+			}
+		}
+		for (int i = 0; i < nv.size(); i++) {
+			boolean was = false;
+			for (int k = 0; k < old.size(); k++)
+				if (old.get(k).dir.equals(nv.get(i).dir))
+					was = true;
+			if (!was && nv.get(i).removable)
+				toast("Drive connected: " + nv.get(i).label);
+		}
+		listCache.clear();
+		if (leftTree != null)
+			refresh();
+	}
+
+	void dropPath(String path) {
+		File internal = Environment.getExternalStorageDirectory();
+		if (leftRoot.getAbsolutePath().startsWith(path)) {
+			leftRoot = internal;
+			leftOpen.clear();
+			leftOpen.add(internal.getAbsolutePath());
+		}
+		if (rightRoot.getAbsolutePath().startsWith(path)) {
+			rightRoot = internal;
+			rightOpen.clear();
+			rightOpen.add(internal.getAbsolutePath());
+		}
+		if (leftCur.getAbsolutePath().startsWith(path))
+			leftCur = leftRoot;
+		if (rightCur.getAbsolutePath().startsWith(path))
+			rightCur = rightRoot;
+		if (selected != null && selected.getAbsolutePath().startsWith(path))
+			selected = null;
+		if (multiMode)
+			exitMulti();
+	}
+
+	void registerStorageReceiver() {
+		try {
+			IntentFilter f = new IntentFilter();
+			f.addAction(Intent.ACTION_MEDIA_MOUNTED);
+			f.addAction(Intent.ACTION_MEDIA_UNMOUNTED);
+			f.addAction(Intent.ACTION_MEDIA_EJECT);
+			f.addAction(Intent.ACTION_MEDIA_REMOVED);
+			f.addAction(Intent.ACTION_MEDIA_BAD_REMOVAL);
+			f.addDataScheme("file");
+			registerReceiver(storageReceiver, f);
+		} catch (Exception e) {
+		}
+	}
+
+	ArrayList<VolInfo> storageVolumes() {
+		ArrayList<VolInfo> out = new ArrayList<VolInfo>();
+		HashSet<String> seen = new HashSet<String>();
+		VolInfo in = new VolInfo();
+		in.label = "Internal storage";
+		in.dir = Environment.getExternalStorageDirectory();
+		out.add(in);
+		seen.add(in.dir.getAbsolutePath());
+		try {
+			if (Build.VERSION.SDK_INT >= 24) {
+				android.os.storage.StorageManager sm = (android.os.storage.StorageManager) getSystemService(Context.STORAGE_SERVICE);
+				java.util.List<android.os.storage.StorageVolume> vs = sm.getStorageVolumes();
+				for (int k = 0; k < vs.size(); k++) {
+					android.os.storage.StorageVolume v = vs.get(k);
+					if (v.isPrimary())
+						continue;
+					String st = v.getState();
+					if (!"mounted".equals(st) && !"mounted_ro".equals(st))
+						continue;
+					File d = null;
+					if (Build.VERSION.SDK_INT >= 30)
+						d = v.getDirectory();
+					else {
+						try {
+							d = (File) v.getClass().getMethod("getPathFile").invoke(v);
+						} catch (Exception e) {
+						}
+					}
+					if (d == null) {
+						String uuid = v.getUuid();
+						if (uuid != null)
+							d = new File("/storage/" + uuid);
+					}
+					if (d == null)
+						continue;
+					if (d.list() == null) {
+						File alt = new File("/mnt/media_rw/" + d.getName());
+						if (alt.list() != null)
+							d = alt;
+						else
+							continue;
+					}
+					if (!seen.add(d.getAbsolutePath()))
+						continue;
+					VolInfo vi = new VolInfo();
+					String desc = v.getDescription(this);
+					vi.label = desc != null && desc.length() > 0 ? desc : d.getName();
+					vi.dir = d;
+					vi.removable = true;
+					out.add(vi);
+				}
+			}
+		} catch (Exception e) {
+		}
+		// fallback / extra: anything mounted directly under /storage or /mnt/media_rw
+		String[] bases = { "/storage", "/mnt/media_rw" };
+		for (int bi = 0; bi < bases.length; bi++) {
+			try {
+				File[] s = new File(bases[bi]).listFiles();
+				if (s != null)
+					for (int k = 0; k < s.length; k++) {
+						File d = s[k];
+						String n = d.getName();
+						if (n.equals("emulated") || n.equals("self") || !d.isDirectory() || d.list() == null)
+							continue;
+						boolean dup = false;
+						for (int q = 0; q < out.size(); q++)
+							if (out.get(q).dir.getName().equals(n))
+								dup = true;
+						if (dup || !seen.add(d.getAbsolutePath()))
+							continue;
+						VolInfo vi = new VolInfo();
+						vi.label = "USB drive (" + n + ")";
+						vi.dir = d;
+						vi.removable = true;
+						out.add(vi);
+					}
+			} catch (Exception e) {
+			}
+		}
+		return out;
+	}
+
+	void showStorageList() {
+		final ArrayList<VolInfo> vols = storageVolumes();
+		final ArrayList<String> labels = new ArrayList<String>();
+		final ArrayList<String> icons = new ArrayList<String>();
+		for (int i = 0; i < vols.size(); i++) {
+			VolInfo v = vols.get(i);
+			String free = "";
+			try {
+				android.os.StatFs st = new android.os.StatFs(v.dir.getAbsolutePath());
+				free = "   " + gb(st.getAvailableBytes()) + " free of " + gb(st.getTotalBytes());
+			} catch (Exception e) {
+			}
+			labels.add(v.label + free + "\n" + v.dir.getAbsolutePath());
+			icons.add(v.removable ? "\uD83D\uDD0C" : "\uD83D\uDCF1");
+		}
+		labels.add("USB drive not listed?");
+		icons.add("\u2139\uFE0F");
+		createDialog("Storage", null).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
+			public void onClick(DialogInterface d, int which) {
+				if (which >= vols.size()) {
+					showMessageDialog("USB drive not listed?",
+						"The drive must be mounted by Android first. Connect it through the OTG adapter, wait a few seconds, then open this list again.\n\n"
+							+ "Android mounts FAT32 and exFAT drives. If the drive is NTFS-only or has no usable partition, Android will not mount it and no file manager can read it without a special driver.\n\n"
+							+ "Also check that \"All files access\" is allowed for this app.");
+					return;
+				}
+				boolean left = selected != null ? selectedLeft : true;
+				jumpToRoot(vols.get(which).dir, left);
+			}
+		}).show();
+	}
+
+	void jumpToRoot(File dir, boolean left) {
+		if (!dir.isDirectory()) {
+			toast("That drive is not available");
+			return;
+		}
+		listCache.clear();
+		if (left) {
+			leftRoot = dir;
+			leftCur = dir;
+			leftOpen.clear();
+			leftOpen.add(dir.getAbsolutePath());
+		} else {
+			rightRoot = dir;
+			rightCur = dir;
+			rightOpen.clear();
+			rightOpen.add(dir.getAbsolutePath());
+		}
+		if (multiMode)
+			exitMulti();
+		selected = null;
+		refresh();
 	}
 
 	void makeUi() {
@@ -325,6 +595,9 @@ public class MainActivity extends Activity {
 
 		final LinearLayout.LayoutParams leftPanelLp = new LinearLayout.LayoutParams(0, -1, splitWeight);
 		final LinearLayout.LayoutParams rightPanelLp = new LinearLayout.LayoutParams(0, -1, 2f - splitWeight);
+		bodyRef = body;
+		leftLpRef = leftPanelLp;
+		rightLpRef = rightPanelLp;
 		body.addView(panel(leftCrumbScroll, leftTree, leftLines, true), leftPanelLp);
 		body.addView(divider(body, leftPanelLp, rightPanelLp), new LinearLayout.LayoutParams(18 * dp, -1));
 		body.addView(panel(rightCrumbScroll, rightTree, rightLines, false), rightPanelLp);
@@ -500,6 +773,14 @@ public class MainActivity extends Activity {
 
 	void updateCrumbs(final LinearLayout host, final HorizontalScrollView sv, File root, File cur, final boolean left) {
 		host.removeAllViews();
+		if (cur instanceof MegaItem)
+			root = MegaItem.root();
+		else if (cur != null && !cur.equals(root) && !underPath(cur, root)) {
+			ArrayList<VolInfo> vl = volCache;
+			for (int i = 0; i < vl.size(); i++)
+				if (vl.get(i).dir.equals(cur) || underPath(cur, vl.get(i).dir))
+					root = vl.get(i).dir;
+		}
 		ArrayList<File> chain = new ArrayList<File>();
 		File f = cur;
 		while (f != null && !f.equals(root)) {
@@ -630,6 +911,21 @@ public class MainActivity extends Activity {
 			}
 		});
 		b.addView(hiddenBtn, new LinearLayout.LayoutParams(0, -1, 1));
+
+		TextView storageBtn = new TextView(this);
+		storageBtn.setText("\uD83D\uDCBE");
+		storageBtn.setTextSize(16);
+		storageBtn.setGravity(Gravity.CENTER);
+		storageBtn.setTextColor(colText);
+		storageBtn.setPadding(10 * dp, 0, 10 * dp, 0);
+		storageBtn.setContentDescription("Storage: internal, SD card, USB drive");
+		applyRipple(storageBtn);
+		storageBtn.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				showStorageList();
+			}
+		});
+		b.addView(storageBtn, new LinearLayout.LayoutParams(-2, -1));
 
 		TextView searchBtn = new TextView(this);
 		searchBtn.setText("\uD83D\uDD0D");
@@ -1258,7 +1554,8 @@ public class MainActivity extends Activity {
 	}
 
 	boolean isPaneRoot(File f) {
-		return f.equals(leftRoot) || f.equals(rightRoot);
+		return f.equals(leftRoot) || f.equals(rightRoot) || isVolumeRoot(f)
+				|| (f instanceof MegaItem && ((MegaItem) f).isRootNode());
 	}
 
 	void refresh() {
@@ -1310,6 +1607,9 @@ public class MainActivity extends Activity {
 		new Thread(new Runnable() {
 			public void run() {
 				prefetch(root, opened);
+				ArrayList<VolInfo> pv = volCache;
+				for (int pi = 0; pi < pv.size(); pi++)
+					prefetch(pv.get(pi).dir, opened);
 				runOnUiThread(new Runnable() {
 					public void run() {
 					
@@ -1327,6 +1627,14 @@ public class MainActivity extends Activity {
 		ArrayList<LineSpec> specs = new ArrayList<LineSpec>();
 		int[] yCursor = {0};
 		addNode(host, specs, yCursor, root, left, 0, true, new ArrayList<Boolean>(), true);
+		ArrayList<VolInfo> vols = volCache;
+		for (int i = 0; i < vols.size(); i++) {
+			File vd = vols.get(i).dir;
+			if (vd.equals(root) || underPath(vd, root))
+				continue;
+			addNode(host, specs, yCursor, vd, left, 0, true, new ArrayList<Boolean>(), true);
+		}
+		addNode(host, specs, yCursor, MegaItem.root(), left, 0, true, new ArrayList<Boolean>(), true);
 
 		ViewGroup.LayoutParams lp = lines.getLayoutParams();
 		if (lp == null)
@@ -1343,6 +1651,8 @@ public class MainActivity extends Activity {
 		int rowH = rootNode ? 84 * dp : 48 * dp;
 		HashSet<String> opened = left ? leftOpen : rightOpen;
 		boolean expanded = f.isDirectory() && opened.contains(f.getAbsolutePath());
+		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !MegaClient.isReady())
+			expanded = false;
 		File[] arr = null;
 		if (expanded) {
 			arr = filterHidden(children(f));
@@ -1443,13 +1753,11 @@ public class MainActivity extends Activity {
 		row.setPadding(0, 0, 4 * dp, 0);
 		if (rootNode)
 			row.setBackgroundColor(colRootRow);
-		else if (inMulti(f, left))
-			row.setBackgroundColor(colMultiRow);
 		else if (searching && searchMatches.contains(f.getAbsolutePath()))
 			row.setBackgroundColor(colSearchRow);
 		else
 			row.setBackgroundColor(
-					!(multiMode && left == multiLeft) && selected != null && left == selectedLeft && selected.equals(f)
+					selected != null && left == selectedLeft && selected.equals(f)
 							? colSelectedRow
 							: colSurface);
 		if (!rootNode)
@@ -1468,9 +1776,9 @@ public class MainActivity extends Activity {
 
 		TextView icon = new TextView(this);
 		icon.setGravity(Gravity.CENTER);
-		String iconText = rootNode ? "📱"
+		String iconText = rootNode ? (f instanceof MegaItem ? "☁" : isRemovableVol(f) ? "💾" : "📱")
 				: (f instanceof DexItem ? dexIcon((DexItem) f)
-						: (ZipItem.isZipRoot(f) ? "📦" : (f.isDirectory() ? "📁" : fileTypeIcon(f.getName()))));
+						: (ZipItem.isZipLike(f) ? "📦" : (f.isDirectory() ? "📁" : fileTypeIcon(f.getName()))));
 		icon.setText(iconText);
 		icon.setTextSize(rootNode ? 22 : 18);
 		int iconW = iconText.length() == 0 ? 0 : (rootNode ? 34 * dp : 26 * dp);
@@ -1500,7 +1808,9 @@ public class MainActivity extends Activity {
 		textBox.addView(name, new LinearLayout.LayoutParams(-1, 0, 1));
 
 		TextView sub = new TextView(this);
-		if (rootNode)
+		if (rootNode && f instanceof MegaItem)
+			sub.setText(MegaClient.statusText());
+		else if (rootNode)
 			sub.setText(f.getAbsolutePath());
 		else
 			sub.setText(f.isDirectory() ? detail(f).trim() : human(f.length()));
@@ -1512,10 +1822,6 @@ public class MainActivity extends Activity {
 
 		View.OnClickListener click = new View.OnClickListener() {
 			public void onClick(View v) {
-				if (multiMode && left == multiLeft && !rootNode) {
-					toggleMulti(f);
-					return;
-				}
 				markSelected(f, left);
 				if (f.isDirectory())
 					toggleFolder(f, left);
@@ -1536,12 +1842,15 @@ public class MainActivity extends Activity {
 		View.OnLongClickListener lc = new View.OnLongClickListener() {
 			public boolean onLongClick(View v) {
 				v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-				if (!rootNode && !multiMode) {
+				if (!rootNode) {
 					markSelected(f, left);
 					row.setBackgroundColor(colSelectedRow);
 				}
-				if (rootNode)
-					return true; 
+				if (rootNode) {
+					if (f instanceof MegaItem)
+						showMegaMenu();
+					return true;
+				}
 				if (multiMode) {
 					
 					if (left == multiLeft) {
@@ -1559,7 +1868,7 @@ public class MainActivity extends Activity {
 		};
 		View.OnTouchListener pressTouch = new View.OnTouchListener() {
 			public boolean onTouch(View v, MotionEvent event) {
-				if (rootNode || multiMode) return false;
+				if (rootNode) return false;
 				switch (event.getActionMasked()) {
 					case MotionEvent.ACTION_DOWN:
 						// Clear the old visual highlight without rebuilding the tree.
@@ -1634,16 +1943,30 @@ public class MainActivity extends Activity {
 			}
 		}
 		row.addView(textBox, new LinearLayout.LayoutParams(0, -1, 1));
-		if (multiMode && left == multiLeft && !rootNode) {
+		if (!rootNode) {
 			CheckMark cm = new CheckMark(this, inMulti(f, left));
 			cm.setOnClickListener(new View.OnClickListener() {
 				public void onClick(View v) {
-					toggleMulti(f);
+					tickToggle(f, left);
 				}
 			});
-			cm.setOnTouchListener(pressTouch);
 			cm.setOnLongClickListener(lc);
-			row.addView(cm, new LinearLayout.LayoutParams(28 * dp, -1));
+			row.addView(cm, new LinearLayout.LayoutParams(40 * dp, -1));
+		}
+		if (rootNode && f instanceof MegaItem && MegaClient.hasSession()) {
+			TextView out = new TextView(this);
+			out.setText("Log out");
+			out.setTextSize(12);
+			out.setTextColor(colText);
+			out.setGravity(Gravity.CENTER);
+			out.setPadding(10 * dp, 0, 10 * dp, 0);
+			applyRipple(out);
+			out.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					showMegaLogout();
+				}
+			});
+			row.addView(out, new LinearLayout.LayoutParams(-2, -1));
 		}
 		return row;
 	}
@@ -1737,7 +2060,30 @@ public class MainActivity extends Activity {
 		opened.add(root.getAbsolutePath());
 	}
 
-	void toggleFolder(File f, boolean left) {
+	void toggleFolder(final File f, final boolean left) {
+		HashSet<String> op = left ? leftOpen : rightOpen;
+		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !MegaClient.isReady()) {
+			final String rp = f.getAbsolutePath();
+			megaConnect(new Runnable() {
+				public void run() {
+					(left ? leftOpen : rightOpen).remove(rp);
+					toggleFolderNow(f, left);
+				}
+			});
+			return;
+		}
+		if (f instanceof ZipItem && ZipItem.isZipLike(f) && !op.contains(f.getAbsolutePath())) {
+			ZipItem.ensurePassword(this, (ZipItem) f, new Runnable() {
+				public void run() {
+					toggleFolderNow(f, left);
+				}
+			});
+			return;
+		}
+		toggleFolderNow(f, left);
+	}
+
+	void toggleFolderNow(File f, boolean left) {
 		HashSet<String> opened = left ? leftOpen : rightOpen;
 		String p = f.getAbsolutePath();
 		if (opened.contains(p))
@@ -1774,8 +2120,30 @@ public class MainActivity extends Activity {
 		}
 	}
 
+	boolean isRemovableVol(File f) {
+		ArrayList<VolInfo> l = volCache;
+		for (int i = 0; i < l.size(); i++)
+			if (l.get(i).dir.equals(f))
+				return l.get(i).removable;
+		return false;
+	}
+
+	boolean isVolumeRoot(File f) {
+		ArrayList<VolInfo> l = volCache;
+		for (int i = 0; i < l.size(); i++)
+			if (l.get(i).dir.equals(f))
+				return true;
+		return false;
+	}
+
 	String displayRoot(File f) {
+		if (f instanceof MegaItem && ((MegaItem) f).isRootNode())
+			return "MEGA";
 		String p = f.getAbsolutePath();
+		ArrayList<VolInfo> l = volCache;
+		for (int i = 0; i < l.size(); i++)
+			if (l.get(i).removable && l.get(i).dir.equals(f))
+				return l.get(i).label;
 		if (p.equals(Environment.getExternalStorageDirectory().getAbsolutePath()))
 			return "Internal storage";
 		String n = f.getName();
@@ -1884,6 +2252,61 @@ public class MainActivity extends Activity {
 		refreshPane(multiLeft);
 	}
 
+	boolean underPath(File x, File dir) {
+		String p = dir.getAbsolutePath();
+		if (!p.endsWith("/"))
+			p += "/";
+		return x.getAbsolutePath().startsWith(p);
+	}
+
+	boolean hasMultiBelow(File dir) {
+		for (int i = 0; i < multi.size(); i++)
+			if (underPath(multi.get(i), dir))
+				return true;
+		return false;
+	}
+
+	// Folder cycle: 1) folder ticked  2) folder unticked, children ticked  3) all unticked
+	void tickToggle(File f, boolean left) {
+		if (isPaneRoot(f))
+			return;
+		if (!multiMode) {
+			multiMode = true;
+			multiLeft = left;
+			multi.clear();
+		} else if (left != multiLeft) {
+			boolean old = multiLeft;
+			multi.clear();
+			multiMode = true;
+			multiLeft = left;
+			refreshPane(old);
+		}
+		boolean isDir = f.isDirectory(); // zip roots and zip entries count as folders
+		if (!isDir) {
+			if (multi.contains(f))
+				multi.remove(f);
+			else
+				multi.add(f);
+		} else if (multi.contains(f)) {
+			multi.remove(f);
+			File[] c = filterHidden(children(f));
+			if (c != null)
+				for (int i = 0; i < c.length; i++)
+					if (!multi.contains(c[i]))
+						multi.add(c[i]);
+		} else if (hasMultiBelow(f)) {
+			for (int i = multi.size() - 1; i >= 0; i--)
+				if (underPath(multi.get(i), f))
+					multi.remove(i);
+		} else {
+			multi.add(f);
+		}
+		if (multi.isEmpty())
+			multiMode = false;
+		updateSelBar();
+		refreshPane(left);
+	}
+
 	void exitMulti() {
 		multiMode = false;
 		multi.clear();
@@ -1905,7 +2328,7 @@ public class MainActivity extends Activity {
 	void updateSelBar() {
 		if (selBar == null)
 			return;
-		selBar.setVisibility(multiMode ? View.VISIBLE : View.GONE);
+		selBar.setVisibility(View.GONE);
 		selCount.setText(multi.size() + (multi.size() == 1 ? " item selected" : " items selected"));
 	}
 
@@ -1923,39 +2346,26 @@ public class MainActivity extends Activity {
 
 	class CheckMark extends View {
 		boolean on;
-		android.graphics.Paint box, fillP, tick;
+		android.graphics.Paint tick;
 		CheckMark(Context c, boolean on) {
 			super(c);
 			this.on = on;
-			box = new android.graphics.Paint();
-			box.setAntiAlias(true);
-			box.setStyle(android.graphics.Paint.Style.STROKE);
-			box.setStrokeWidth(Math.max(1.5f, 1.5f * dp));
-			box.setColor(Color.rgb(130, 145, 155));
-			fillP = new android.graphics.Paint();
-			fillP.setAntiAlias(true);
-			fillP.setColor(Color.rgb(230, 130, 20));
 			tick = new android.graphics.Paint();
 			tick.setAntiAlias(true);
 			tick.setStyle(android.graphics.Paint.Style.STROKE);
-			tick.setStrokeWidth(2.2f * dp);
-			tick.setColor(Color.WHITE);
 			tick.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+			tick.setStrokeJoin(android.graphics.Paint.Join.ROUND);
+			tick.setStrokeWidth((on ? 5.5f : 5f) * dp);
+			tick.setColor(on ? Color.rgb(215, 125, 30) : Color.argb(90, 150, 165, 175));
 		}
-		
+
 		protected void onDraw(android.graphics.Canvas c) {
-			float sz = 18 * dp, cx = getWidth() / 2f, cy = getHeight() / 2f, l = cx - sz / 2f, t = cy - sz / 2f;
-			android.graphics.RectF r = new android.graphics.RectF(l, t, l + sz, t + sz);
-			if (on) {
-				c.drawRoundRect(r, 3 * dp, 3 * dp, fillP);
-				android.graphics.Path p = new android.graphics.Path();
-				p.moveTo(l + 0.22f * sz, cy);
-				p.lineTo(l + 0.43f * sz, cy + 0.2f * sz);
-				p.lineTo(l + 0.78f * sz, cy - 0.2f * sz);
-				c.drawPath(p, tick);
-			} else {
-				c.drawRoundRect(r, 3 * dp, 3 * dp, box);
-			}
+			float sz = 20 * dp, cx = getWidth() / 2f, cy = getHeight() / 2f, l = cx - sz / 2f;
+			android.graphics.Path p = new android.graphics.Path();
+			p.moveTo(l + 0.08f * sz, cy + 0.02f * sz);
+			p.lineTo(l + 0.38f * sz, cy + 0.32f * sz);
+			p.lineTo(l + 0.92f * sz, cy - 0.30f * sz);
+			c.drawPath(p, tick);
 		}
 	}
 
@@ -1993,6 +2403,10 @@ public class MainActivity extends Activity {
 			toast("Tap items in the tree to select them");
 			return;
 		}
+		if (a != 1 && a != 7 && hasMega(multi)) {
+			toast("MEGA is read-only: you can only copy files out of it");
+			return;
+		}
 		if (a == 1)
 			transferMulti(false);
 		else if (a == 2)
@@ -2013,6 +2427,32 @@ public class MainActivity extends Activity {
 			toast("Not available for several items");
 	}
 
+	void uploadToMega(ArrayList<File> srcs, MegaItem dst, boolean move) {
+		if (move) {
+			toast("Use Copy to upload to MEGA");
+			return;
+		}
+		if (dst.isRootNode()) {
+			toast("Open a MEGA folder (for example Cloud Drive) first");
+			return;
+		}
+		if (!MegaClient.isReady()) {
+			toast("Connect to MEGA first");
+			return;
+		}
+		ArrayList<File> ok = new ArrayList<File>();
+		for (int i = 0; i < srcs.size(); i++) {
+			File s = srcs.get(i);
+			if (!(s instanceof MegaItem) && !(s instanceof ZipItem))
+				ok.add(s);
+		}
+		if (ok.isEmpty()) {
+			toast("Only files and folders on this device can be uploaded to MEGA");
+			return;
+		}
+		fileOperations.startUploadToMega(ok, dst);
+	}
+
 	void transferMulti(boolean move) {
 		ArrayList<File> srcs = multiItems();
 		if (srcs.isEmpty()) {
@@ -2021,6 +2461,14 @@ public class MainActivity extends Activity {
 		}
 		
 		File dstDir = multiLeft ? rightCur : leftCur;
+		if (dstDir instanceof MegaItem) {
+			uploadToMega(srcs, (MegaItem) dstDir, move);
+			return;
+		}
+		if (hasMega(srcs) && (move || dstDir instanceof ZipItem)) {
+			toast(move ? "MEGA is read-only: use Copy" : "Copy MEGA files into a normal folder first");
+			return;
+		}
 		if (dstDir instanceof ZipItem) {
 			ZipItem dz = (ZipItem) dstDir;
 			ArrayList<File> ok = new ArrayList<File>();
@@ -2179,7 +2627,7 @@ public class MainActivity extends Activity {
 		ArrayList<Uri> uris = new ArrayList<Uri>();
 		for (int i = 0; i < items.size(); i++) {
 			File s = items.get(i);
-			if (s instanceof ZipItem || !s.isFile())
+			if (s instanceof ZipItem || s instanceof MegaItem || !s.isFile())
 				continue;
 			uris.add(new Uri.Builder().scheme("content").authority(FileShareProvider.AUTH).path(s.getAbsolutePath())
 					.build());
@@ -2207,6 +2655,17 @@ public class MainActivity extends Activity {
 	
 	void action(int a) {
 		if (a == 6) {
+			if (multiMode || !multi.isEmpty()) {
+				multiMode = false;
+				multi.clear();
+				updateSelBar();
+			}
+			if (leftLpRef != null && rightLpRef != null) {
+				leftLpRef.weight = 1f;
+				rightLpRef.weight = 1f;
+				splitWeight = 1f;
+				bodyRef.requestLayout();
+			}
 			expandFirstLevel();
 			refresh(true, true, false);
 			return;
@@ -2262,13 +2721,25 @@ public class MainActivity extends Activity {
 			toast("Select a file or folder first");
 			return;
 		}
+		if (selected instanceof MegaItem) {
+			megaAction(a);
+			return;
+		}
 		if (a == 10) {
 			if (ZipItem.isZipRoot(selected))
 				ZipItem.extractRoot(this);
 			return;
 		}
-		if (a == 11 || a == 12) {
-			openItem(selected, a == 12);
+		if (a == 12) {
+			openItem(selected, true);
+			return;
+		}
+		if (a == 11) {
+			// Open = same as a short tap: built-in previewer if there is one, otherwise the app list
+			if (selected.isDirectory())
+				openItem(selected, false);
+			else
+				previewFile(selected);
 			return;
 		}
 		if (a == 13) {
@@ -2430,10 +2901,22 @@ public class MainActivity extends Activity {
 		final ArrayList<String> labels = new ArrayList<String>();
 		final ArrayList<String> icons = new ArrayList<String>();
 		final ArrayList<Integer> codes = new ArrayList<Integer>();
+		if (f instanceof MegaItem) {
+			addItem(labels, icons, codes, "\uD83D\uDC41\uFE0F", "Open", 11);
+			if (!f.isDirectory())
+				addItem(labels, icons, codes, "\u2197\uFE0F", "Open with", 12);
+			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy (download)", 1);
+			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
+			createDialog(f.getName(), null).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
+				public void onClick(DialogInterface d, int which) {
+					action(codes.get(which).intValue());
+				}
+			}).show();
+			return;
+		}
 		boolean zipEntry = f instanceof ZipItem && !((ZipItem) f).isRoot();
 		boolean plainFolder = f.isDirectory() && !(f instanceof ZipItem);
 		if (!isPaneRoot(f)) {
-			addItem(labels, icons, codes, "\u2705", "Select", 20);
 			addItem(labels, icons, codes, "\uD83D\uDC41\uFE0F", "Open", 11);
 			if (!(f.isDirectory() && !ZipItem.isZipRoot(f)))
 				addItem(labels, icons, codes, "\u2197\uFE0F", "Open with", 12);
@@ -2457,7 +2940,7 @@ public class MainActivity extends Activity {
 			addItem(labels, icons, codes, "\uD83D\uDCC4", "New text file", 40);
 			addItem(labels, icons, codes, "\u274C", "Delete", 5);
 			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
-			addItem(labels, icons, codes, "\uD83D\uDDD0\uFE0F", "Duplicate", 8);
+			addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
 			addItem(labels, icons, codes, "\uD83D\uDCE6", "Zip", 9);
 			if (plainFolder)
 				addItem(labels, icons, codes, isBookmarked(f) ? "\u2606" : "\u2605",
@@ -2526,7 +3009,7 @@ public class MainActivity extends Activity {
 		addItem(labels, icons, codes, "\u2722", "Move", 2);
 		addItem(labels, icons, codes, "\u274C", "Delete", 5);
 		addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
-		addItem(labels, icons, codes, "\uD83D\uDDD0\uFE0F", "Duplicate", 8);
+		addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
 		addItem(labels, icons, codes, "\uD83D\uDCE6", "Zip", 9);
 		addItem(labels, icons, codes, "\uD83D\uDCE4", "Share", 13);
 		createDialog(multi.size() + " selected", null)
@@ -2537,7 +3020,15 @@ public class MainActivity extends Activity {
 				}).show();
 	}
 
-	void openItem(File f, boolean chooser) {
+	void openItem(File f, final boolean chooser) {
+		if (f instanceof MegaItem && !f.isDirectory()) {
+			megaFetch((MegaItem) f, new MegaItem.Done() {
+				public void done(File t) {
+					launchFile(t, chooser);
+				}
+			});
+			return;
+		}
 		if (f.isDirectory() && !ZipItem.isZipRoot(f)) {
 			toggleFolder(f, selectedLeft);
 			return;
@@ -2600,7 +3091,8 @@ public class MainActivity extends Activity {
 		i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
 		i.setClipData(ClipData.newRawUri(f.getName(), uri));
 		try {
-			startActivity(chooser ? Intent.createChooser(i, "Open with") : i);
+			// plain ACTION_VIEW: Android's own app resolver lists every app that can open the file
+			startActivity(i);
 		} catch (ActivityNotFoundException e) {
 			toast("No app found to open this file");
 		} catch (Exception e) {
@@ -2611,6 +3103,280 @@ public class MainActivity extends Activity {
 	PreviewManager getPreviewManager() {
 		if (previewManager == null) previewManager = new PreviewManager(this);
 		return previewManager;
+	}
+
+	// ---------------- MEGA ----------------
+	boolean hasMega(ArrayList<File> l) {
+		for (int i = 0; i < l.size(); i++)
+			if (l.get(i) instanceof MegaItem)
+				return true;
+		return false;
+	}
+
+	void saveMega() {
+		MegaClient.save(prefs);
+	}
+
+	void megaConnect(final Runnable ok) {
+		if (MegaClient.isReady()) {
+			ok.run();
+			return;
+		}
+		if (!MegaClient.hasSession()) {
+			showMegaLogin(ok, null);
+			return;
+		}
+		toast("Connecting to MEGA...");
+		new Thread(new Runnable() {
+			public void run() {
+				String err = null;
+				boolean relogin = false;
+				try {
+					MegaClient.loadTree();
+				} catch (MegaException e) {
+					err = e.getMessage();
+					relogin = e.code == -15 || e.code == -9 || e.code == -11;
+				} catch (Exception e) {
+					err = e.getMessage() == null ? e.toString() : e.getMessage();
+				}
+				final String m = err;
+				final boolean rl = relogin;
+				runOnUiThread(new Runnable() {
+					public void run() {
+						if (m == null) {
+							listCache.clear();
+							ok.run();
+						} else if (rl) {
+							MegaClient.logout();
+							saveMega();
+							showMegaLogin(ok, m);
+						} else
+							toast(m);
+					}
+				});
+			}
+		}).start();
+	}
+
+	void showMegaLogin(final Runnable ok, final String msg) {
+		AlertDialog.Builder b = createDialog("Log in to MEGA", null);
+		Context cx = b.getContext(); // dialog context, same as the Rename popup
+		LinearLayout box = new LinearLayout(cx);
+		box.setOrientation(LinearLayout.VERTICAL);
+		final EditText em = new EditText(cx);
+		em.setHint("E-mail");
+		em.setSingleLine(true);
+		em.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+		em.setText(prefs.getString("mega_last_email", ""));
+		box.addView(em, new LinearLayout.LayoutParams(-1, -2));
+		final EditText pw = new EditText(cx);
+		pw.setHint("Password");
+		pw.setSingleLine(true);
+		pw.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+		box.addView(pw, new LinearLayout.LayoutParams(-1, -2));
+		final EditText mfa = new EditText(cx);
+		mfa.setHint("2FA code (only if you use it)");
+		mfa.setSingleLine(true);
+		mfa.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+		box.addView(mfa, new LinearLayout.LayoutParams(-1, -2));
+		themeDialogView(box);
+		if (msg != null) {
+			TextView err = new TextView(cx);
+			err.setText(msg);
+			err.setTextColor(Color.rgb(230, 80, 70));
+			err.setTextSize(13);
+			err.setTextIsSelectable(true);
+			err.setPadding(4 * dp, 10 * dp, 4 * dp, 4 * dp);
+			box.addView(err, new LinearLayout.LayoutParams(-1, -2));
+		}
+		ScrollView outer = new ScrollView(cx);
+		outer.addView(box);
+		b.setView(outer)
+				.setPositiveButton("Log in", new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface d, int w) {
+						doMegaLogin(em.getText().toString(), pw.getText().toString(), mfa.getText().toString(), ok);
+					}
+				}).setNegativeButton("Cancel", null)
+				.show();
+	}
+
+	void doMegaLogin(final String mail, final String pass, final String code, final Runnable ok) {
+		prefs.edit().putString("mega_last_email", mail.trim()).commit();
+		MegaClient.clearLog();
+		MegaClient.log("login start");
+		final AlertDialog wait = busyDialog("MEGA", "Logging in...");
+		new Thread(new Runnable() {
+			public void run() {
+				String err = null;
+				int errCode = 0;
+				try {
+					MegaClient.login(mail, pass, code);
+					MegaClient.loadTree();
+					saveMega();
+				} catch (MegaException e) {
+					err = e.getMessage();
+					errCode = e.code;
+				} catch (Throwable e) {
+					err = e.toString();
+					MegaClient.log("!! " + e + (e.getStackTrace().length > 0 ? " at " + e.getStackTrace()[0] : ""));
+				}
+				final String m = err;
+				final int ec = errCode;
+				runOnUiThread(new Runnable() {
+					public void run() {
+						try {
+							wait.dismiss();
+						} catch (Exception e) {
+						}
+						if (m == null) {
+							listCache.clear();
+							ok.run();
+						} else
+							showMegaLogin(ok, ec == -26 ? "Enter your two-factor (2FA) code and log in again" : m);
+					}
+				});
+			}
+		}).start();
+	}
+
+	void showMegaLogout() {
+		String who = MegaClient.email == null || MegaClient.email.length() == 0 ? "your MEGA account" : MegaClient.email;
+		showConfirmDialog("Log out of MEGA", "Log out of " + who + "?", "Log out", "Cancel",
+				new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface d, int w) {
+						doMegaLogout();
+					}
+				});
+	}
+
+	void doMegaLogout() {
+		MegaClient.logout();
+		saveMega();
+		listCache.clear();
+		leftOpen.remove(MegaItem.root().getAbsolutePath());
+		rightOpen.remove(MegaItem.root().getAbsolutePath());
+		if (leftCur instanceof MegaItem)
+			leftCur = leftRoot;
+		if (rightCur instanceof MegaItem)
+			rightCur = rightRoot;
+		selected = null;
+		exitMulti();
+		refresh();
+		toast("Logged out of MEGA");
+	}
+
+	void showMegaMenu() {
+		final ArrayList<String> labels = new ArrayList<String>();
+		final ArrayList<String> icons = new ArrayList<String>();
+		final ArrayList<Integer> codes = new ArrayList<Integer>();
+		if (MegaClient.hasSession()) {
+			addItem(labels, icons, codes, "\uD83D\uDD04", "Reload MEGA", 1);
+			addItem(labels, icons, codes, "\uD83D\uDEAA", "Log out", 2);
+		} else
+			addItem(labels, icons, codes, "\uD83D\uDD11", "Log in", 3);
+		createDialog("MEGA", MegaClient.statusText()).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
+			public void onClick(DialogInterface d, int which) {
+				int c = codes.get(which).intValue();
+				if (c == 2) {
+					showMegaLogout();
+				} else {
+					MegaClient.ready = false;
+					listCache.clear();
+					megaConnect(new Runnable() {
+						public void run() {
+							refresh();
+						}
+					});
+				}
+			}
+		}).show();
+	}
+
+	/** downloads a MEGA file into the cache (once) and hands the local copy to cb */
+	void megaFetch(final MegaItem mi, final MegaItem.Done cb) {
+		final File dir = new File(getCacheDir(), "mega/" + mi.handle + "_" + mi.lastModified());
+		final File out = new File(dir, mi.getName());
+		if (out.exists() && out.length() == mi.length()) {
+			cb.done(out);
+			return;
+		}
+		toast("Downloading " + mi.getName() + "...");
+		new Thread(new Runnable() {
+			public void run() {
+				String err = null;
+				InputStream in = null;
+				OutputStream os = null;
+				try {
+					dir.mkdirs();
+					File tmp = new File(dir, mi.getName() + ".part");
+					in = mi.openStream();
+					os = new FileOutputStream(tmp);
+					byte[] b = new byte[65536];
+					int n;
+					while ((n = in.read(b)) > 0)
+						os.write(b, 0, n);
+					os.close();
+					os = null;
+					if (!tmp.renameTo(out))
+						throw new IOException("Cannot save the downloaded file");
+				} catch (Exception e) {
+					err = e.getMessage() == null ? e.toString() : e.getMessage();
+				} finally {
+					try {
+						if (in != null)
+							in.close();
+					} catch (IOException e) {
+					}
+					try {
+						if (os != null)
+							os.close();
+					} catch (IOException e) {
+					}
+				}
+				final String m = err;
+				runOnUiThread(new Runnable() {
+					public void run() {
+						if (m != null)
+							toast("MEGA: " + m);
+						else
+							cb.done(out);
+					}
+				});
+			}
+		}).start();
+	}
+
+	void megaAction(int a) {
+		final MegaItem mi = (MegaItem) selected;
+		if (a == 1) {
+			transfer(false);
+			return;
+		}
+		if (a == 7) {
+			showMessageDialog(mi.getName(), "In MEGA\nType: " + (mi.isDirectory() ? "Folder" : "File")
+					+ (mi.isDirectory() ? "" : "\nSize: " + human(mi.length())) + "\nModified: "
+					+ (new Date(mi.lastModified())) + "\nRead-only");
+			return;
+		}
+		if (a == 11 || a == 12) {
+			if (mi.isDirectory())
+				toggleFolder(mi, selectedLeft);
+			else if (a == 11)
+				previewFile(mi);
+			else
+				openItem(mi, true);
+			return;
+		}
+		if (a == 13) {
+			if (!mi.isDirectory())
+				megaFetch(mi, new MegaItem.Done() {
+					public void done(File f) {
+						shareItem(f);
+					}
+				});
+			return;
+		}
+		toast("MEGA is read-only: you can open files and copy them out");
 	}
 
 	void previewFile(final File f) {
@@ -2706,6 +3472,14 @@ public class MainActivity extends Activity {
 		
 		File dstDir = selectedLeft ? rightCur : leftCur;
 		File src = selected;
+		if (dstDir instanceof MegaItem) {
+			uploadToMega(one(src), (MegaItem) dstDir, move);
+			return;
+		}
+		if (src instanceof MegaItem && (move || dstDir instanceof ZipItem)) {
+			toast(move ? "MEGA is read-only: use Copy" : "Copy MEGA files into a normal folder first");
+			return;
+		}
 		if (dstDir instanceof ZipItem) {
 			ZipItem dz = (ZipItem) dstDir;
 			if (src.getAbsolutePath().equals(dz.zip.getAbsolutePath())) {
@@ -2865,6 +3639,8 @@ public class MainActivity extends Activity {
 
 	protected void onResume() {
 		super.onResume();
+		volHandler.removeCallbacks(volPoll);
+		volHandler.post(volPoll);
 		if (leftTree != null)
 			refresh();
 	}
