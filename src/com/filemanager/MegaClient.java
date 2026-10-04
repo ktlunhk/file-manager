@@ -20,7 +20,7 @@ class MegaException extends IOException {
 
 /**
  * Minimal MEGA client written against MEGA's public web API: log in, read the file tree, download files.
- * Can log in, read the tree, download, upload files and create folders (no rename or delete).
+ * Log in, read the tree, download, upload, create folders, rename, move, copy and delete.
  */
 class MegaClient {
 	static final String API = "https://g.api.mega.co.nz/cs";
@@ -30,6 +30,7 @@ class MegaClient {
 		int t; // 0 file, 1 folder, 2 cloud drive, 3 inbox, 4 rubbish bin
 		long size, ts;
 		byte[] key;
+		String attr; // decrypted attribute json, kept so a rename does not drop the other attributes
 	}
 
 	static String sid, email, uid;
@@ -400,6 +401,7 @@ class MegaClient {
 						continue; // not ours (shared by someone else)
 					n.key = nk;
 					String json = MegaCrypto.decryptAttr(o.optString("a", ""), nk);
+					n.attr = json;
 					n.name = json == null ? n.h : new JSONObject(json).optString("n", n.h);
 					n.name = n.name.replace('/', '_');
 					if (n.name.length() == 0)
@@ -472,7 +474,8 @@ class MegaClient {
 	/** puts a new node under parent (a=p) and adds it to the local tree; returns its handle */
 	private static String putNode(String token, int t, String name, byte[] nodeKey, String parent, long size) throws IOException {
 		try {
-			String attr = MegaCrypto.encryptAttr(new JSONObject().put("n", name).toString(), nodeKey);
+			String attrJson = new JSONObject().put("n", name).toString();
+			String attr = MegaCrypto.encryptAttr(attrJson, nodeKey);
 			String k = MegaCrypto.b64e(MegaCrypto.aesEcb(nodeKey, masterKey, true));
 			JSONObject node = new JSONObject().put("h", token).put("t", t).put("a", attr).put("k", k);
 			step = "p";
@@ -483,6 +486,9 @@ class MegaClient {
 			JSONObject o = f.getJSONObject(0);
 			String h = o.getString("h");
 			addNode(h, parent, t, name, o.optLong("s", size), o.optLong("ts", System.currentTimeMillis() / 1000), nodeKey);
+			Node added = node(h);
+			if (added != null)
+				added.attr = attrJson;
 			return h;
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
@@ -626,6 +632,206 @@ class MegaClient {
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
 		}
+	}
+
+	// ---------------- change the tree: rename, move, delete, copy ----------------
+	static synchronized String rubbishHandle() {
+		for (Node n : nodes.values())
+			if (n.t == 4)
+				return n.h;
+		return null;
+	}
+
+	/** true when h is in the Rubbish Bin (or is it) */
+	static synchronized boolean inRubbish(String h) {
+		String cur = h;
+		for (int g = 0; cur != null && cur.length() > 0 && g < 64; g++) {
+			Node n = nodes.get(cur);
+			if (n == null)
+				return false;
+			if (n.t == 4)
+				return true;
+			cur = n.p;
+		}
+		return false;
+	}
+
+	/** true when h is `ancestor` itself or somewhere below it */
+	static synchronized boolean isInside(String h, String ancestor) {
+		String cur = h;
+		for (int g = 0; cur != null && cur.length() > 0 && g < 64; g++) {
+			if (cur.equals(ancestor))
+				return true;
+			Node n = nodes.get(cur);
+			cur = n == null ? null : n.p;
+		}
+		return false;
+	}
+
+	static synchronized ArrayList<String> kidsOf(String h) {
+		ArrayList<String> l = kids.get(h);
+		return l == null ? new ArrayList<String>() : new ArrayList<String>(l);
+	}
+
+	private static synchronized void detach(String h) {
+		Node n = nodes.get(h);
+		if (n == null)
+			return;
+		ArrayList<String> l = kids.get(n.p);
+		if (l != null)
+			l.remove(h);
+	}
+
+	private static synchronized void dropTree(String h) {
+		ArrayList<String> k = kids.remove(h);
+		if (k != null)
+			for (String c : new ArrayList<String>(k))
+				dropTree(c);
+		nodes.remove(h);
+	}
+
+	/** a free name in `parent`: base+ext, then "base 2"+ext ... */
+	static String freeName(String parent, String base, String ext) {
+		String out = base + ext;
+		int i = 2;
+		while (child(parent, out, false) != null || child(parent, out, true) != null) {
+			out = base + " " + i + ext;
+			i++;
+		}
+		return out;
+	}
+
+	/** "name copy.ext", "name copy 2.ext" ... that is free in `parent` */
+	static String copyName(String parent, String name, boolean folder) {
+		String base = name, ext = "";
+		int dot = name.lastIndexOf('.');
+		if (!folder && dot > 0) {
+			base = name.substring(0, dot);
+			ext = name.substring(dot);
+		}
+		String out = base + " copy" + ext;
+		int i = 2;
+		while (child(parent, out, folder) != null) {
+			out = base + " copy " + i + ext;
+			i++;
+		}
+		return out;
+	}
+
+	static void rename(String h, String newName) throws IOException {
+		Node n = node(h);
+		if (n == null || n.key == null)
+			throw new IOException("Cannot rename this item");
+		try {
+			JSONObject j = n.attr != null && n.attr.length() > 0 ? new JSONObject(n.attr) : new JSONObject();
+			j.put("n", newName);
+			String json = j.toString();
+			String attr = MegaCrypto.encryptAttr(json, n.key);
+			String k = MegaCrypto.b64e(MegaCrypto.aesEcb(n.key, masterKey, true));
+			step = "a";
+			api(new JSONObject().put("a", "a").put("n", h).put("attr", attr).put("key", k));
+			synchronized (MegaClient.class) {
+				n.name = newName;
+				n.attr = json;
+			}
+		} catch (JSONException e) {
+			throw bad("JSON " + e.getMessage());
+		}
+	}
+
+	static void move(String h, String newParent) throws IOException {
+		try {
+			step = "m";
+			api(new JSONObject().put("a", "m").put("n", h).put("t", newParent));
+		} catch (JSONException e) {
+			throw bad("JSON " + e.getMessage());
+		}
+		synchronized (MegaClient.class) {
+			Node n = nodes.get(h);
+			if (n == null)
+				return;
+			detach(h);
+			n.p = newParent;
+			ArrayList<String> l = kids.get(newParent);
+			if (l == null) {
+				l = new ArrayList<String>();
+				kids.put(newParent, l);
+			}
+			if (!l.contains(h))
+				l.add(h);
+		}
+	}
+
+	/** permanent delete */
+	static void remove(String h) throws IOException {
+		try {
+			step = "d";
+			api(new JSONObject().put("a", "d").put("n", h));
+		} catch (JSONException e) {
+			throw bad("JSON " + e.getMessage());
+		}
+		synchronized (MegaClient.class) {
+			detach(h);
+			dropTree(h);
+		}
+	}
+
+	/** to the Rubbish Bin, or gone for good when it already is in there */
+	static void trashOrDelete(String h) throws IOException {
+		if (inRubbish(h)) {
+			remove(h);
+			return;
+		}
+		String rb = rubbishHandle();
+		if (rb == null)
+			throw new IOException("Rubbish Bin not found");
+		move(h, rb);
+	}
+
+	/** server side copy of a file (no data is transferred); the new node gets newName */
+	static String copyFileTo(String srcH, String parent, String newName) throws IOException {
+		Node n = node(srcH);
+		if (n == null || n.key == null)
+			throw new IOException("Cannot copy this item");
+		try {
+			JSONObject j = n.attr != null && n.attr.length() > 0 ? new JSONObject(n.attr) : new JSONObject();
+			j.put("n", newName);
+			String json = j.toString();
+			String attr = MegaCrypto.encryptAttr(json, n.key);
+			String k = MegaCrypto.b64e(MegaCrypto.aesEcb(n.key, masterKey, true));
+			JSONObject node = new JSONObject().put("h", srcH).put("t", 0).put("a", attr).put("k", k);
+			step = "p";
+			JSONObject r = apiObj(new JSONObject().put("a", "p").put("t", parent).put("n", new JSONArray().put(node)));
+			JSONArray f = r.optJSONArray("f");
+			if (f == null || f.length() == 0)
+				throw bad("no node in reply (" + describe(r) + ")");
+			JSONObject o = f.getJSONObject(0);
+			String h = o.getString("h");
+			addNode(h, parent, 0, newName, o.optLong("s", n.size), o.optLong("ts", System.currentTimeMillis() / 1000), n.key);
+			Node added = node(h);
+			if (added != null)
+				added.attr = json;
+			return h;
+		} catch (JSONException e) {
+			throw bad("JSON " + e.getMessage());
+		}
+	}
+
+	/** copies a file or a whole folder inside MEGA under a new name */
+	static String copyTree(String srcH, String parent, String newName) throws IOException {
+		Node n = node(srcH);
+		if (n == null)
+			throw new IOException("Item not found");
+		if (n.t == 0)
+			return copyFileTo(srcH, parent, newName);
+		String dir = makeFolder(newName, parent);
+		ArrayList<String> k = kidsOf(srcH);
+		for (int i = 0; i < k.size(); i++) {
+			Node c = node(k.get(i));
+			if (c != null)
+				copyTree(c.h, dir, c.name);
+		}
+		return dir;
 	}
 
 	static void logout() {
