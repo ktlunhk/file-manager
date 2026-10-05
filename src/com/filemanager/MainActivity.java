@@ -186,6 +186,15 @@ public class MainActivity extends Activity {
 	public void onCreate(Bundle b) {
 		super.onCreate(b);
 		ZipItem.cacheDir = getCacheDir();
+		MegaClient.onQuota = new Runnable() {
+			public void run() {
+				uiPost(new Runnable() {
+					public void run() {
+						refresh(true, true, false); // shows the new "Free x/y" on the MEGA rows
+					}
+				});
+			}
+		};
 		fileOperations = new FileOperations(this);
 		if (Build.VERSION.SDK_INT >= 30) {
 		
@@ -193,7 +202,7 @@ public class MainActivity extends Activity {
 		}
 		dp = (int) getResources().getDisplayMetrics().density;
 		prefs = getSharedPreferences("dfm", MODE_PRIVATE);
-		MegaClient.restore(prefs);
+		MegaClient.restoreAll(prefs);
 		leftRoot = Environment.getExternalStorageDirectory();
 		rightRoot = Environment.getExternalStorageDirectory();
 		leftCur = leftRoot;
@@ -814,7 +823,9 @@ public class MainActivity extends Activity {
 	void updateCrumbs(final LinearLayout host, final HorizontalScrollView sv, File root, File cur, final boolean left) {
 		host.removeAllViews();
 		if (cur instanceof MegaItem)
-			root = MegaItem.root();
+			root = MegaItem.rootOf(((MegaItem) cur).acc);
+		else if (cur instanceof ZipItem && ((ZipItem) cur).mega != null)
+			root = MegaItem.rootOf(((ZipItem) cur).mega.acc);
 		else if (cur != null && !cur.equals(root) && !underPath(cur, root)) {
 			ArrayList<VolInfo> vl = volCache;
 			for (int i = 0; i < vl.size(); i++)
@@ -1749,7 +1760,7 @@ public class MainActivity extends Activity {
 	}
 
 	void prefetch(File f, HashSet<String> opened) {
-		if (!(f.isDirectory() && opened.contains(f.getAbsolutePath())))
+		if (!(expandable(f) && opened.contains(f.getAbsolutePath())))
 			return;
 		File[] arr = children(f);
 		if (arr == null || arr.length == 0)
@@ -1792,8 +1803,13 @@ public class MainActivity extends Activity {
 				continue;
 			addNode(host, specs, yCursor, vd, left, 0, true, new ArrayList<Boolean>(), true);
 		}
-		if (showMega)
-			addNode(host, specs, yCursor, MegaItem.root(), left, 0, true, new ArrayList<Boolean>(), true);
+		if (showMega) {
+			// one entry per logged in account; before the first login a single placeholder entry
+			if (MegaClient.accounts.isEmpty())
+				addNode(host, specs, yCursor, MegaItem.root(), left, 0, true, new ArrayList<Boolean>(), true);
+			for (MegaClient mc : MegaClient.accounts)
+				addNode(host, specs, yCursor, MegaItem.rootOf(mc), left, 0, true, new ArrayList<Boolean>(), true);
+		}
 
 		ViewGroup.LayoutParams lp = lines.getLayoutParams();
 		if (lp == null)
@@ -1810,9 +1826,11 @@ public class MainActivity extends Activity {
 			final int level, boolean rootNode, ArrayList<Boolean> ancestorLast, boolean isLast) {
 		int rowH = rootNode ? 84 * dp : 48 * dp;
 		HashSet<String> opened = left ? leftOpen : rightOpen;
-		boolean expanded = f.isDirectory() && opened.contains(f.getAbsolutePath());
-		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !MegaClient.isReady())
+		boolean expanded = expandable(f) && opened.contains(f.getAbsolutePath());
+		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !((MegaItem) f).isReady())
 			expanded = false;
+		if (expanded && isMegaArchive(f) && megaArchiveLocal((MegaItem) f) == null)
+			expanded = false; // the downloaded copy was cleaned up: the next tap on the arrow downloads it again
 		File[] arr = null;
 		if (expanded) {
 			arr = filterHidden(children(f));
@@ -1925,10 +1943,10 @@ public class MainActivity extends Activity {
 		View spacer = new View(this);
 		row.addView(spacer, new LinearLayout.LayoutParams((level == 0 ? 0 : (6 + level * 16)) * dp, -1));
 
-		ArrowView exp = new ArrowView(this, f.isDirectory(), expanded);
+		ArrowView exp = new ArrowView(this, expandable(f), expanded);
 		exp.setOnClickListener(new View.OnClickListener() {
 			public void onClick(View v) {
-				if (f.isDirectory())
+				if (expandable(f))
 					toggleFolder(f, left);
 			}
 		});
@@ -1938,7 +1956,7 @@ public class MainActivity extends Activity {
 		icon.setGravity(Gravity.CENTER);
 		String iconText = rootNode ? (f instanceof MegaItem ? "☁" : isRemovableVol(f) ? "💾" : "📱")
 				: (f instanceof DexItem ? dexIcon((DexItem) f)
-						: (ZipItem.isZipLike(f) ? "📦" : (f.isDirectory() ? "📁" : fileTypeIcon(f.getName()))));
+						: ((ZipItem.isZipLike(f) || isMegaArchive(f)) ? "📦" : (f.isDirectory() ? "📁" : fileTypeIcon(f.getName()))));
 		icon.setText(iconText);
 		icon.setTextSize(rootNode ? 22 : 18);
 		int iconW = iconText.length() == 0 ? 0 : (rootNode ? 34 * dp : 26 * dp);
@@ -1969,11 +1987,12 @@ public class MainActivity extends Activity {
 
 		TextView sub = new TextView(this);
 		if (rootNode && f instanceof MegaItem)
-			sub.setText(MegaClient.statusText());
+			sub.setText(((MegaItem) f).statusText());
 		else if (rootNode)
 			sub.setText(f.getAbsolutePath());
 		else
-			sub.setText(f.isDirectory() ? detail(f).trim() : human(f.length()));
+			sub.setText(f.isDirectory() ? detail(f).trim()
+					: (expanded && isMegaArchive(f) ? "[" + filterHidden(children(f)).length + "]   " + human(f.length()) : human(f.length())));
 		sub.setTextColor(colTextMuted);
 		sub.setTextSize(rootNode ? 11 : 10);
 		sub.setSingleLine(true);
@@ -1983,7 +2002,7 @@ public class MainActivity extends Activity {
 		View.OnClickListener click = new View.OnClickListener() {
 			public void onClick(View v) {
 				markSelected(f, left);
-				if (f.isDirectory())
+				if (f.isDirectory() || isMegaArchive(f))
 					toggleFolder(f, left);
 				else {
 					status.setText(f.getAbsolutePath() + "   " + human(f.length()));
@@ -2008,7 +2027,7 @@ public class MainActivity extends Activity {
 				}
 				if (rootNode) {
 					if (f instanceof MegaItem)
-						showMegaMenu();
+						showMegaMenu(((MegaItem) f).acc);
 					return true;
 				}
 				if (multiMode) {
@@ -2077,15 +2096,23 @@ public class MainActivity extends Activity {
 
 		if (rootNode) {
 			long tot = 0, free = 0;
-			try {
-				android.os.StatFs st = new android.os.StatFs(f.getAbsolutePath());
-				tot = st.getTotalBytes();
-				free = st.getAvailableBytes();
-			} catch (Exception e) {
+			if (f instanceof MegaItem) {
+				MegaClient qa = ((MegaItem) f).acc;
+				if (qa != null && qa.isReady() && qa.maxBytes > 0 && qa.usedBytes >= 0) {
+					tot = qa.maxBytes;
+					free = Math.max(0L, qa.maxBytes - qa.usedBytes);
+				}
+			} else {
+				try {
+					android.os.StatFs st = new android.os.StatFs(f.getAbsolutePath());
+					tot = st.getTotalBytes();
+					free = st.getAvailableBytes();
+				} catch (Exception e) {
+				}
 			}
 			if (tot > 0) {
 				TextView diskTxt = new TextView(this);
-				diskTxt.setText("Free " + gb(free) + "/" + gb(tot));
+				diskTxt.setText("Free " + capText(free) + "/" + capText(tot));
 				diskTxt.setTextColor(colTextMuted);
 				diskTxt.setTextSize(11);
 				diskTxt.setSingleLine(true);
@@ -2113,20 +2140,40 @@ public class MainActivity extends Activity {
 			cm.setOnLongClickListener(lc);
 			row.addView(cm, new LinearLayout.LayoutParams(40 * dp, -1));
 		}
-		if (rootNode && f instanceof MegaItem && MegaClient.hasSession()) {
-			TextView out = new TextView(this);
-			out.setText("Log out");
-			out.setTextSize(12);
-			out.setTextColor(colText);
-			out.setGravity(Gravity.CENTER);
-			out.setPadding(10 * dp, 0, 10 * dp, 0);
-			applyRipple(out);
-			out.setOnClickListener(new View.OnClickListener() {
+		if (rootNode && f instanceof MegaItem && ((MegaItem) f).acc != null) {
+			final MegaClient rowAcc = ((MegaItem) f).acc;
+			TextView add = new TextView(this);
+			add.setText("+");
+			add.setTextSize(22);
+			add.setTextColor(colText);
+			add.setGravity(Gravity.CENTER);
+			add.setPadding(10 * dp, 0, 10 * dp, 0);
+			applyRipple(add);
+			add.setOnClickListener(new View.OnClickListener() {
 				public void onClick(View v) {
-					showMegaLogout();
+					showMegaLogin(null, new Runnable() {
+						public void run() {
+							refresh();
+						}
+					}, null);
 				}
 			});
-			row.addView(out, new LinearLayout.LayoutParams(-2, -1));
+			row.addView(add, new LinearLayout.LayoutParams(-2, -1));
+			if (rowAcc.hasSession()) {
+				TextView out = new TextView(this);
+				out.setText("Log out");
+				out.setTextSize(12);
+				out.setTextColor(colText);
+				out.setGravity(Gravity.CENTER);
+				out.setPadding(10 * dp, 0, 10 * dp, 0);
+				applyRipple(out);
+				out.setOnClickListener(new View.OnClickListener() {
+					public void onClick(View v) {
+						showMegaLogout(rowAcc);
+					}
+				});
+				row.addView(out, new LinearLayout.LayoutParams(-2, -1));
+			}
 		}
 		return row;
 	}
@@ -2250,14 +2297,69 @@ public class MainActivity extends Activity {
 		opened.add(root.getAbsolutePath());
 	}
 
+	/** a zip/apk/jar/tar that lives in MEGA: it is shown like a folder, its content comes from a downloaded copy */
+	boolean isMegaArchive(File f) {
+		return f instanceof MegaItem && f.isFile() && ZipItem.isZipName(f.getName());
+	}
+
+	boolean expandable(File f) {
+		return f.isDirectory() || isMegaArchive(f);
+	}
+
+	/** the downloaded copy of a MEGA archive (same cache place megaFetch uses), or null when it is not downloaded yet */
+	File megaArchiveLocal(MegaItem mi) {
+		File out = new File(getCacheDir(), "mega/" + mi.handle + "_" + mi.lastModified() + "/" + mi.getName());
+		// a finished download is renamed from .part, so any non-empty file is complete
+		return out.exists() && out.length() > 0 ? out : null;
+	}
+
+	File[] megaArchiveChildren(MegaItem mi) {
+		File local = megaArchiveLocal(mi);
+		if (local == null)
+			return new File[0];
+		ZipItem root = new ZipItem(local, "", true, local.length(), mi.lastModified());
+		root.mega = mi;
+		File[] kids = root.listFiles();
+		String err = ZipItem.lastError;
+		if (err != null) {
+			ZipItem.lastError = null;
+			toast(err);
+		}
+		return kids == null ? new File[0] : kids;
+	}
+
 	void toggleFolder(final File f, final boolean left) {
 		HashSet<String> op = left ? leftOpen : rightOpen;
-		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !MegaClient.isReady()) {
-			final String rp = f.getAbsolutePath();
-			megaConnect(new Runnable() {
+		if (isMegaArchive(f) && !op.contains(f.getAbsolutePath())) {
+			// download the archive once, then open it like a folder
+			final MegaItem mi = (MegaItem) f;
+			megaFetch(mi, new MegaItem.Done() {
+				public void done(File local) {
+					if (local == null || !local.exists() || local.length() == 0) {
+						toast("Cannot open " + mi.getName() + ": the download is empty");
+						return;
+					}
+					ZipItem root = new ZipItem(local, "", true, local.length(), mi.lastModified());
+					root.mega = mi;
+					ZipItem.ensurePassword(MainActivity.this, root, new Runnable() {
+						public void run() {
+							listCache.remove(mi.getAbsolutePath());
+							toggleFolderNow(f, left);
+						}
+					});
+				}
+			});
+			return;
+		}
+		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !((MegaItem) f).isReady()) {
+			megaConnect(((MegaItem) f).acc, new Runnable() {
 				public void run() {
-					(left ? leftOpen : rightOpen).remove(rp);
-					toggleFolderNow(f, left);
+					File target = f;
+					// the placeholder row has just become the first account
+					if (((MegaItem) f).acc == null && !MegaClient.accounts.isEmpty())
+						target = MegaItem.rootOf(MegaClient.accounts.get(MegaClient.accounts.size() - 1));
+					(left ? leftOpen : rightOpen).remove(target.getAbsolutePath());
+					toggleFolderNow(target, left);
 				}
 			});
 			return;
@@ -2282,6 +2384,21 @@ public class MainActivity extends Activity {
 			opened.add(p);
 		markSelected(f, left);
 		refreshPane(left);
+	}
+
+	/** 123GB, and 1.8TB once it is more than a terabyte */
+	String capText(long bytes) {
+		double g = bytes / 1073741824.0;
+		if (g >= 1024)
+			return String.format(Locale.US, "%.1fTB", g / 1024.0);
+		return gb(bytes);
+	}
+
+	/** the MEGA usage changes with every upload, copy or delete */
+	void refreshMegaQuota() {
+		for (MegaClient c : MegaClient.accounts)
+			if (c.isReady())
+				c.refreshQuota();
 	}
 
 	String gb(long bytes) {
@@ -2328,7 +2445,7 @@ public class MainActivity extends Activity {
 
 	String displayRoot(File f) {
 		if (f instanceof MegaItem && ((MegaItem) f).isRootNode())
-			return "MEGA";
+			return ((MegaItem) f).rootTitle();
 		String p = f.getAbsolutePath();
 		ArrayList<VolInfo> l = volCache;
 		for (int i = 0; i < l.size(); i++)
@@ -2615,32 +2732,41 @@ public class MainActivity extends Activity {
 			toast("Not available for several items");
 	}
 
-	/** copy or move into a MEGA folder: local items are uploaded, MEGA items are copied/moved inside MEGA */
+	/** copy or move into a MEGA folder: local items are uploaded, MEGA items of the same account are copied/moved inside
+	 * MEGA, MEGA items of another account are streamed over (download, decrypt, encrypt, upload) without a temp file */
 	void uploadToMega(ArrayList<File> srcs, MegaItem dst, boolean move) {
 		if (dst.isRootNode()) {
 			toast("Open a MEGA folder (for example Cloud Drive) first");
 			return;
 		}
-		if (!MegaClient.isReady()) {
+		if (!dst.isReady()) {
 			toast("Connect to MEGA first");
 			return;
 		}
-		ArrayList<File> local = new ArrayList<File>(), mega = new ArrayList<File>();
+		ArrayList<File> up = new ArrayList<File>(), same = new ArrayList<File>();
 		for (int i = 0; i < srcs.size(); i++) {
 			File s = srcs.get(i);
-			if (s instanceof MegaItem)
-				mega.add(s);
-			else if (!(s instanceof ZipItem))
-				local.add(s);
+			if (s instanceof MegaItem) {
+				MegaItem ms = (MegaItem) s;
+				if (ms.acc == dst.acc)
+					same.add(s);
+				else if (ms.isReady())
+					up.add(s);
+				else {
+					toast("Connect to the other MEGA account first");
+					return;
+				}
+			} else if (!(s instanceof ZipItem))
+				up.add(s);
 		}
-		if (local.isEmpty() && mega.isEmpty()) {
+		if (up.isEmpty() && same.isEmpty()) {
 			toast("Items inside a zip cannot be sent to MEGA directly. Extract them first");
 			return;
 		}
-		if (!mega.isEmpty())
-			megaCopyMove(mega, dst, move);
-		if (!local.isEmpty())
-			fileOperations.startUploadToMega(local, dst, move);
+		if (!same.isEmpty())
+			megaCopyMove(same, dst, move);
+		if (!up.isEmpty())
+			fileOperations.startUploadToMega(up, dst, move);
 	}
 
 	void transferMulti(boolean move) {
@@ -2730,9 +2856,11 @@ public class MainActivity extends Activity {
 			return;
 		}
 		boolean allPerm = !mega.isEmpty();
-		for (int i = 0; i < mega.size(); i++)
-			if (!MegaClient.inRubbish(((MegaItem) mega.get(i)).handle))
+		for (int i = 0; i < mega.size(); i++) {
+			MegaItem mm = (MegaItem) mega.get(i);
+			if (!mm.acc.inRubbish(mm.handle))
 				allPerm = false;
+		}
 		String msg = "Delete " + items.size() + (items.size() == 1 ? " item?" : " items?");
 		if (!mega.isEmpty())
 			msg += allPerm ? "\n\nItems in the MEGA Rubbish Bin are deleted permanently." : "\n\nMEGA items go to the MEGA Rubbish Bin.";
@@ -3091,21 +3219,22 @@ public class MainActivity extends Activity {
 	}
 
 	File[] children(File f) {
-		if (!f.isDirectory())
+		if (!f.isDirectory() && !isMegaArchive(f))
 			return null;
 		String key = f.getAbsolutePath();
 		File[] cached = listCache.get(key);
 		if (cached != null)
 			return cached;
-		File[] a = f.listFiles();
+		File[] a = isMegaArchive(f) ? megaArchiveChildren((MegaItem) f) : f.listFiles();
 		String zerr = ZipItem.lastError;
 		if (zerr != null && f instanceof ZipItem) {
 			ZipItem.lastError = null;
 			toast(zerr);
 		}
-		if (a != null && !(f instanceof ZipItem)) {
+		if (a != null && !(f instanceof ZipItem) && !isMegaArchive(f)) {
 			for (int i = 0; i < a.length; i++) {
-				if (a[i].isFile() && ZipItem.isZipName(a[i].getName()))
+				// MEGA files are not on the phone, so an archive in MEGA stays a plain file (open/copy downloads it)
+				if (a[i].isFile() && !(a[i] instanceof MegaItem) && ZipItem.isZipName(a[i].getName()))
 					a[i] = new ZipItem(a[i], "", true, a[i].length(), a[i].lastModified());
 			}
 		}
@@ -3495,16 +3624,21 @@ public class MainActivity extends Activity {
 	}
 
 	void saveMega() {
-		MegaClient.save(prefs);
+		MegaClient.saveAll(prefs);
 	}
 
-	void megaConnect(final Runnable ok) {
-		if (MegaClient.isReady()) {
+	/** loads the tree of one account; acc == null means there is no account yet, so the login window is shown */
+	void megaConnect(final MegaClient acc, final Runnable ok) {
+		if (acc == null) {
+			showMegaLogin(null, ok, null);
+			return;
+		}
+		if (acc.isReady()) {
 			ok.run();
 			return;
 		}
-		if (!MegaClient.hasSession()) {
-			showMegaLogin(ok, null);
+		if (!acc.hasSession()) {
+			showMegaLogin(acc, ok, null);
 			return;
 		}
 		toast("Connecting to MEGA...");
@@ -3513,7 +3647,7 @@ public class MainActivity extends Activity {
 				String err = null;
 				boolean relogin = false;
 				try {
-					MegaClient.loadTree();
+					acc.loadTree();
 				} catch (MegaException e) {
 					err = e.getMessage();
 					relogin = e.code == -15 || e.code == -9 || e.code == -11;
@@ -3528,9 +3662,9 @@ public class MainActivity extends Activity {
 							listCache.clear();
 							ok.run();
 						} else if (rl) {
-							MegaClient.logout();
+							acc.dropSession();
 							saveMega();
-							showMegaLogin(ok, m);
+							showMegaLogin(acc, ok, m);
 						} else
 							toast(m);
 					}
@@ -3539,8 +3673,9 @@ public class MainActivity extends Activity {
 		}).start();
 	}
 
-	void showMegaLogin(final Runnable ok, final String msg) {
-		AlertDialog.Builder b = createDialog("Log in to MEGA", null);
+	/** login window. acc == null adds a new account, otherwise that account logs in again (its session expired) */
+	void showMegaLogin(final MegaClient acc, final Runnable ok, final String msg) {
+		AlertDialog.Builder b = createDialog(acc == null ? "Add a MEGA account" : "Log in to MEGA", null);
 		Context cx = b.getContext(); // dialog context, same as the Rename popup
 		LinearLayout box = new LinearLayout(cx);
 		box.setOrientation(LinearLayout.VERTICAL);
@@ -3550,7 +3685,12 @@ public class MainActivity extends Activity {
 		em.setHint("E-mail");
 		em.setSingleLine(true);
 		em.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
-		em.setText(prefs.getString("mega_last_email", ""));
+		String lastMail = prefs.getString("mega_last_email", "");
+		if (acc != null && acc.email != null && acc.email.length() > 0)
+			lastMail = acc.email;
+		else if (MegaClient.byEmail(lastMail) != null)
+			lastMail = ""; // that one is already added, the new account is a different one
+		em.setText(lastMail);
 		box.addView(em, new LinearLayout.LayoutParams(-1, -2));
 		final EditText pw = new EditText(cx);
 		alignInput(pw);
@@ -3579,24 +3719,33 @@ public class MainActivity extends Activity {
 		b.setView(outer)
 				.setPositiveButton("Log in", new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
-						doMegaLogin(em.getText().toString(), pw.getText().toString(), mfa.getText().toString(), ok);
+						doMegaLogin(acc, em.getText().toString(), pw.getText().toString(), mfa.getText().toString(), ok);
 					}
 				}).setNegativeButton("Cancel", null)
 				.show();
 	}
 
-	void doMegaLogin(final String mail, final String pass, final String code, final Runnable ok) {
+	void doMegaLogin(final MegaClient acc, final String mail, final String pass, final String code, final Runnable ok) {
 		prefs.edit().putString("mega_last_email", mail.trim()).commit();
 		MegaClient.clearLog();
 		MegaClient.log("login start");
+		// a new account object is only added to the list once the login worked
+		final MegaClient target = acc != null ? acc : new MegaClient();
 		final AlertDialog wait = busyDialog("MEGA", "Logging in...");
 		new Thread(new Runnable() {
 			public void run() {
 				String err = null;
 				int errCode = 0;
 				try {
-					MegaClient.login(mail, pass, code);
-					MegaClient.loadTree();
+					target.login(mail, pass, code);
+					MegaClient dup = MegaClient.byEmail(target.email);
+					if (dup != null && dup != target) {
+						String who = target.email;
+						target.logout();
+						throw new MegaException(0, who + " is already added");
+					}
+					target.loadTree();
+					MegaClient.register(target);
 					saveMega();
 				} catch (MegaException e) {
 					err = e.getMessage();
@@ -3617,57 +3766,81 @@ public class MainActivity extends Activity {
 							listCache.clear();
 							ok.run();
 						} else
-							showMegaLogin(ok, ec == -26 ? "Enter your two-factor (2FA) code and log in again" : m);
+							showMegaLogin(acc, ok, ec == -26 ? "Enter your two-factor (2FA) code and log in again" : m);
 					}
 				});
 			}
 		}).start();
 	}
 
-	void showMegaLogout() {
-		String who = MegaClient.email == null || MegaClient.email.length() == 0 ? "your MEGA account" : MegaClient.email;
+	void showMegaLogout(final MegaClient acc) {
+		String who = acc.email == null || acc.email.length() == 0 ? "your MEGA account" : acc.email;
 		showConfirmDialog("Log out of MEGA", "Log out of " + who + "?", "Log out", "Cancel",
 				new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int w) {
-						doMegaLogout();
+						doMegaLogout(acc);
 					}
 				});
 	}
 
-	void doMegaLogout() {
-		MegaClient.logout();
+	/** removes the paths inside one account from a set of open folders */
+	void forgetMegaPaths(HashSet<String> open, String prefix) {
+		for (Iterator<String> it = open.iterator(); it.hasNext();) {
+			String p = it.next();
+			if (p.equals(prefix) || p.startsWith(prefix + "/"))
+				it.remove();
+		}
+	}
+
+	void doMegaLogout(MegaClient acc) {
+		String prefix = MegaItem.rootOf(acc).getAbsolutePath();
+		acc.logout();
+		MegaClient.unregister(acc);
 		saveMega();
 		listCache.clear();
-		leftOpen.remove(MegaItem.root().getAbsolutePath());
-		rightOpen.remove(MegaItem.root().getAbsolutePath());
-		if (leftCur instanceof MegaItem)
+		forgetMegaPaths(leftOpen, prefix);
+		forgetMegaPaths(rightOpen, prefix);
+		if (leftCur instanceof MegaItem && ((MegaItem) leftCur).acc == acc)
 			leftCur = leftRoot;
-		if (rightCur instanceof MegaItem)
+		if (rightCur instanceof MegaItem && ((MegaItem) rightCur).acc == acc)
 			rightCur = rightRoot;
-		selected = null;
+		if (selected instanceof MegaItem && ((MegaItem) selected).acc == acc)
+			selected = null;
 		exitMulti();
 		refresh();
 		toast("Logged out of MEGA");
 	}
 
-	void showMegaMenu() {
+	void showMegaMenu(final MegaClient acc) {
 		final ArrayList<String> labels = new ArrayList<String>();
 		final ArrayList<String> icons = new ArrayList<String>();
 		final ArrayList<Integer> codes = new ArrayList<Integer>();
-		if (MegaClient.hasSession()) {
+		if (acc != null && acc.hasSession()) {
 			addItem(labels, icons, codes, "\uD83D\uDD04", "Reload MEGA", 1);
 			addItem(labels, icons, codes, "\uD83D\uDEAA", "Log out", 2);
-		} else
+		} else {
 			addItem(labels, icons, codes, "\uD83D\uDD11", "Log in", 3);
-		createDialog("MEGA", MegaClient.statusText()).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
+			if (acc != null) // the session expired: the row can be taken out of the list
+				addItem(labels, icons, codes, "\uD83D\uDEAA", "Remove account", 2);
+		}
+		addItem(labels, icons, codes, "\u2795", "Add another account", 4);
+		String who = acc == null ? "No account yet" : (acc.email == null ? "" : acc.email + " - ") + acc.statusText();
+		createDialog("MEGA", who).setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
 			public void onClick(DialogInterface d, int which) {
 				int c = codes.get(which).intValue();
 				if (c == 2) {
-					showMegaLogout();
+					showMegaLogout(acc);
+				} else if (c == 4) {
+					showMegaLogin(null, new Runnable() {
+						public void run() {
+							refresh();
+						}
+					}, null);
 				} else {
-					MegaClient.ready = false;
+					if (acc != null)
+						acc.ready = false;
 					listCache.clear();
-					megaConnect(new Runnable() {
+					megaConnect(acc, new Runnable() {
 						public void run() {
 							refresh();
 						}
@@ -3760,7 +3933,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		if (a == 7) {
-			showMessageDialog(mi.getName(), "In MEGA" + (MegaClient.inRubbish(mi.handle) ? " (Rubbish Bin)" : "") + "\nType: "
+			showMessageDialog(mi.getName(), "In MEGA" + (mi.acc.email == null || mi.acc.email.length() == 0 ? "" : " (" + mi.acc.email + ")") + (mi.acc.inRubbish(mi.handle) ? " (Rubbish Bin)" : "") + "\nType: "
 					+ (mi.isDirectory() ? "Folder" : "File")
 					+ (mi.isDirectory() ? "" : "\nSize: " + human(mi.length())) + "\nModified: "
 					+ (new Date(mi.lastModified())));
@@ -3825,6 +3998,7 @@ public class MainActivity extends Activity {
 						listCache.clear();
 						refresh();
 						toast(m);
+						refreshMegaQuota();
 					}
 				});
 			}
@@ -3836,7 +4010,7 @@ public class MainActivity extends Activity {
 			toast("Open a MEGA folder (for example Cloud Drive) first");
 			return false;
 		}
-		if (!MegaClient.isReady()) {
+		if (!base.isReady()) {
 			toast("Connect to MEGA first");
 			return false;
 		}
@@ -3848,17 +4022,18 @@ public class MainActivity extends Activity {
 			toast("Invalid name");
 			return;
 		}
-		MegaClient.Node node = MegaClient.node(mi.handle);
+		final MegaClient ac = mi.acc;
+		MegaClient.Node node = ac.node(mi.handle);
 		if (node == null)
 			return;
-		String ex = MegaClient.child(node.p, n, mi.isDirectory());
+		String ex = ac.child(node.p, n, mi.isDirectory());
 		if (ex != null && !ex.equals(mi.handle)) {
 			toast("Already exists");
 			return;
 		}
 		megaTask("Renaming", new MegaWork() {
 			public String run() throws Exception {
-				MegaClient.rename(mi.handle, n);
+				ac.rename(mi.handle, n);
 				return "Renamed";
 			}
 		});
@@ -3871,14 +4046,14 @@ public class MainActivity extends Activity {
 			toast("Invalid name");
 			return;
 		}
-		if (MegaClient.child(base.handle, n, true) != null || MegaClient.child(base.handle, n, false) != null) {
+		if (base.acc.child(base.handle, n, true) != null || base.acc.child(base.handle, n, false) != null) {
 			toast("Already exists");
 			return;
 		}
 		(selectedLeft ? leftOpen : rightOpen).add(base.getAbsolutePath());
 		megaTask("Creating folder", new MegaWork() {
 			public String run() throws Exception {
-				MegaClient.makeFolder(n, base.handle);
+				base.acc.makeFolder(n, base.handle);
 				return "Folder created";
 			}
 		});
@@ -3890,7 +4065,7 @@ public class MainActivity extends Activity {
 		(selectedLeft ? leftOpen : rightOpen).add(base.getAbsolutePath());
 		megaTask("Creating file", new MegaWork() {
 			public String run() throws Exception {
-				String name = MegaClient.freeName(base.handle, "untitled", ".txt");
+				String name = base.acc.freeName(base.handle, "untitled", ".txt");
 				File dir = new File(getCacheDir(), "mega-new");
 				dir.mkdirs();
 				File f = new File(dir, name);
@@ -3901,13 +4076,13 @@ public class MainActivity extends Activity {
 				};
 				try {
 					try {
-						MegaClient.uploadFile(f, base.handle, none);
+						base.acc.uploadFile(f, base.handle, none);
 					} catch (IOException e) {
 						// in case the server refuses an empty upload, put a single line break in the file
 						FileOutputStream os = new FileOutputStream(f);
 						os.write('\n');
 						os.close();
-						MegaClient.uploadFile(f, base.handle, none);
+						base.acc.uploadFile(f, base.handle, none);
 					}
 				} finally {
 					f.delete();
@@ -3925,15 +4100,17 @@ public class MainActivity extends Activity {
 					if (!(items.get(i) instanceof MegaItem))
 						continue;
 					String h = ((MegaItem) items.get(i)).handle;
-					boolean covered = false; // already inside another selected folder
+					MegaClient ac = ((MegaItem) items.get(i)).acc;
+					boolean covered = false; // already inside another selected folder of the same account
 					for (int j = 0; j < items.size(); j++)
-						if (j != i && items.get(j) instanceof MegaItem && MegaClient.isInside(h, ((MegaItem) items.get(j)).handle))
+						if (j != i && items.get(j) instanceof MegaItem && ((MegaItem) items.get(j)).acc == ac
+								&& ac.isInside(h, ((MegaItem) items.get(j)).handle))
 							covered = true;
-					if (covered || MegaClient.node(h) == null)
+					if (covered || ac.node(h) == null)
 						continue;
-					if (MegaClient.inRubbish(h))
+					if (ac.inRubbish(h))
 						perm++;
-					MegaClient.trashOrDelete(h);
+					ac.trashOrDelete(h);
 					n++;
 				}
 				if (n > 0 && perm == n)
@@ -3950,10 +4127,11 @@ public class MainActivity extends Activity {
 				for (int i = 0; i < items.size(); i++) {
 					if (!(items.get(i) instanceof MegaItem))
 						continue;
-					MegaClient.Node node = MegaClient.node(((MegaItem) items.get(i)).handle);
+					MegaClient ac = ((MegaItem) items.get(i)).acc;
+					MegaClient.Node node = ac.node(((MegaItem) items.get(i)).handle);
 					if (node == null || node.t >= 2)
 						continue;
-					MegaClient.copyTree(node.h, node.p, MegaClient.copyName(node.p, node.name, node.t != 0));
+					ac.copyTree(node.h, node.p, ac.copyName(node.p, node.name, node.t != 0));
 					n++;
 				}
 				return "Duplicated " + n + (n == 1 ? " item" : " items");
@@ -3972,15 +4150,15 @@ public class MainActivity extends Activity {
 					if (!(srcs.get(i) instanceof MegaItem))
 						continue;
 					MegaItem s = (MegaItem) srcs.get(i);
-					if (s.isSystemNode() || MegaClient.node(s.handle) == null) {
+					if (s.acc != dst.acc || s.isSystemNode() || dst.acc.node(s.handle) == null) {
 						st[2]++;
 						continue;
 					}
-					if (MegaClient.isInside(dst.handle, s.handle)) {
+					if (dst.acc.isInside(dst.handle, s.handle)) {
 						st[2]++; // into itself
 						continue;
 					}
-					megaCopyInto(s.handle, dst.handle, move, st);
+					megaCopyInto(dst.acc, s.handle, dst.handle, move, st);
 				}
 				String verb = move ? "Moved " : "Copied ";
 				return verb + st[0] + (st[0] == 1 ? " item" : " items") + (st[1] > 0 ? ", skipped " + st[1] + " already there" : "")
@@ -3989,12 +4167,12 @@ public class MainActivity extends Activity {
 		});
 	}
 
-	void megaCopyInto(String srcH, String dstParent, boolean move, int[] st) throws IOException {
-		MegaClient.Node n = MegaClient.node(srcH);
+	void megaCopyInto(MegaClient ac, String srcH, String dstParent, boolean move, int[] st) throws IOException {
+		MegaClient.Node n = ac.node(srcH);
 		if (n == null)
 			return;
 		boolean folder = n.t != 0;
-		String existing = MegaClient.child(dstParent, n.name, folder);
+		String existing = ac.child(dstParent, n.name, folder);
 		if (move && n.p.equals(dstParent)) {
 			st[1]++;
 			return;
@@ -4005,27 +4183,27 @@ public class MainActivity extends Activity {
 				return;
 			}
 			if (move)
-				MegaClient.move(srcH, dstParent);
+				ac.move(srcH, dstParent);
 			else
-				MegaClient.copyFileTo(srcH, dstParent, n.name);
+				ac.copyFileTo(srcH, dstParent, n.name);
 			st[0]++;
 			return;
 		}
 		if (existing == null) {
 			if (move) {
-				MegaClient.move(srcH, dstParent);
+				ac.move(srcH, dstParent);
 			} else {
-				MegaClient.copyTree(srcH, dstParent, n.name);
+				ac.copyTree(srcH, dstParent, n.name);
 			}
 			st[0]++;
 			return;
 		}
 		// the folder exists already: merge the content
-		ArrayList<String> k = MegaClient.kidsOf(srcH);
+		ArrayList<String> k = ac.kidsOf(srcH);
 		for (int i = 0; i < k.size(); i++)
-			megaCopyInto(k.get(i), existing, move, st);
-		if (move && MegaClient.kidsOf(srcH).isEmpty())
-			MegaClient.trashOrDelete(srcH);
+			megaCopyInto(ac, k.get(i), existing, move, st);
+		if (move && ac.kidsOf(srcH).isEmpty())
+			ac.trashOrDelete(srcH);
 	}
 
 	void previewFile(final File f) {
@@ -4186,11 +4364,14 @@ public class MainActivity extends Activity {
 		if (parent == null || n.length() == 0)
 			return false;
 		if (parent instanceof MegaItem) {
+			MegaClient pa = ((MegaItem) parent).acc;
+			if (pa == null)
+				return false;
 			String ph = ((MegaItem) parent).handle;
 			String h = self instanceof MegaItem ? ((MegaItem) self).handle : null;
-			String same = MegaClient.child(ph, n, self != null ? self.isDirectory() : true);
+			String same = pa.child(ph, n, self != null ? self.isDirectory() : true);
 			if (self == null && same == null)
-				same = MegaClient.child(ph, n, false); // new folder: a file with that name blocks it too
+				same = pa.child(ph, n, false); // new folder: a file with that name blocks it too
 			return same != null && !same.equals(h);
 		}
 		if (parent instanceof ZipItem || self instanceof ZipItem) {
@@ -4315,7 +4496,7 @@ public class MainActivity extends Activity {
 	void delConfirm() {
 		if (selected instanceof MegaItem) {
 			final MegaItem mi = (MegaItem) selected;
-			boolean perm = MegaClient.inRubbish(mi.handle);
+			boolean perm = mi.acc.inRubbish(mi.handle);
 			createDialog("Delete", (perm ? "Delete permanently: " : "Move to the MEGA Rubbish Bin: ") + mi.getName() + "?")
 					.setPositiveButton("Delete", new DialogInterface.OnClickListener() {
 						public void onClick(DialogInterface d, int w) {
