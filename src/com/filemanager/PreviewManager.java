@@ -129,7 +129,7 @@ class PreviewManager {
 				try { dir.mkdirs(); ZipItem.extract(zi, tmp); }
 				catch (Exception e) { err = "Error: " + e.getMessage(); }
 				final String m = err;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (m != null) activity.toast(m); else preview(tmp);
 					}
@@ -178,7 +178,7 @@ class PreviewManager {
 				}
 				final String ferr = err;
 				final android.graphics.Bitmap fbmp = bmp;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 					
 						if (gen != previewGen)
@@ -224,7 +224,7 @@ class PreviewManager {
 				}
 				final String errF = err;
 				final List<String[]> rowsF = rows;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (gen != previewGen)
 							return;
@@ -438,7 +438,7 @@ class PreviewManager {
 				final String labelF = label, pkgF = pkg, versionNameF = versionName;
 				final long versionCodeF = versionCode;
 				final String[] permsF = perms;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (gen != previewGen)
 							return; // preview screen was left while this was parsing
@@ -791,7 +791,7 @@ class PreviewManager {
 					}
 					final SpannableStringBuilder fs = styled;
 					if (fs == null) return;
-					activity.runOnUiThread(new Runnable() {
+					activity.uiPost(new Runnable() {
 						public void run() {
 							if (gen != previewGen) return;
 							tv.setText(fs, TextView.BufferType.SPANNABLE);
@@ -1296,7 +1296,7 @@ class PreviewManager {
 				}
 				final String ftitle = mtitle, fartist = martist;
 				final android.graphics.Bitmap fart = artBmp;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (gen != previewGen)
 							return;
@@ -1412,7 +1412,7 @@ class PreviewManager {
 				}
 				final android.graphics.Bitmap fbmp = bmp;
 				final String ferr = err;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (gen != previewGen)
 							return; // preview screen was left while this page was rendering
@@ -1510,7 +1510,7 @@ class PreviewManager {
 				final int fcount = count;
 				final android.graphics.pdf.PdfRenderer frenderer = renderer;
 				final android.os.ParcelFileDescriptor fpfd = pfd;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						if (gen != previewGen || ferr != null) {
 							if (frenderer != null)
