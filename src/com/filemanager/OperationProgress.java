@@ -30,7 +30,7 @@ class OperationProgress {
         android.content.Context dialogContext = b.getContext();
         LinearLayout box = new LinearLayout(dialogContext);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(20 * dp, 12 * dp, 20 * dp, 4 * dp);
+        box.setPadding(24 * dp, 12 * dp, 24 * dp, 4 * dp);
         activity.themeDialogView(box);
 
         nameView = new TextView(dialogContext);
