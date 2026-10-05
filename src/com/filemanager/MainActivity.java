@@ -186,6 +186,15 @@ public class MainActivity extends Activity {
 	public void onCreate(Bundle b) {
 		super.onCreate(b);
 		ZipItem.cacheDir = getCacheDir();
+		// old downloads, previews and temp files are removed: older than 3 days, or beyond 500 MB (oldest first)
+		new Thread(new Runnable() {
+			public void run() {
+				try {
+					CacheCleaner.clean(getCacheDir(), 3L * 24 * 3600 * 1000, 500L * 1024 * 1024);
+				} catch (Throwable t) {
+				}
+			}
+		}).start();
 		MegaClient.onQuota = new Runnable() {
 			public void run() {
 				uiPost(new Runnable() {
@@ -1104,7 +1113,89 @@ public class MainActivity extends Activity {
 		section2.setPadding(18 * dp, 18 * dp, 18 * dp, 6 * dp);
 		root.addView(section2, new LinearLayout.LayoutParams(-1, -2));
 		root.addView(megaToggleRow(), new LinearLayout.LayoutParams(-1, -2));
+
+		TextView section3 = new TextView(this);
+		section3.setText("STORAGE");
+		section3.setTextSize(12);
+		section3.setTextColor(colTextMuted);
+		section3.setPadding(18 * dp, 18 * dp, 18 * dp, 6 * dp);
+		root.addView(section3, new LinearLayout.LayoutParams(-1, -2));
+		root.addView(cacheRow(), new LinearLayout.LayoutParams(-1, -2));
 		return root;
+	}
+
+	/** "Clear cache" row of the settings page with the current cache size */
+	View cacheRow() {
+		LinearLayout row = new LinearLayout(this);
+		row.setOrientation(LinearLayout.HORIZONTAL);
+		row.setGravity(Gravity.CENTER_VERTICAL);
+		row.setPadding(18 * dp, 14 * dp, 18 * dp, 14 * dp);
+		row.setBackgroundColor(colSurface);
+		applyRipple(row);
+
+		LinearLayout textBox = new LinearLayout(this);
+		textBox.setOrientation(LinearLayout.VERTICAL);
+		TextView t = new TextView(this);
+		t.setText("Clear cache");
+		t.setTextSize(15);
+		t.setTextColor(colText);
+		textBox.addView(t, new LinearLayout.LayoutParams(-2, -2));
+		final TextView s = new TextView(this);
+		s.setText("Calculating...");
+		s.setTextSize(12);
+		s.setTextColor(colTextMuted);
+		textBox.addView(s, new LinearLayout.LayoutParams(-2, -2));
+		row.addView(textBox, new LinearLayout.LayoutParams(0, -2, 1));
+		showCacheSize(s);
+
+		row.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				createDialog("Clear cache", "Downloaded MEGA files, opened archives and previews are removed. They are downloaded again when you need them.")
+						.setPositiveButton("Clear", new DialogInterface.OnClickListener() {
+							public void onClick(DialogInterface d, int w) {
+								s.setText("Clearing...");
+								new Thread(new Runnable() {
+									public void run() {
+										long freed = 0;
+										try {
+											freed = CacheCleaner.clearAll(getCacheDir());
+										} catch (Throwable e) {
+										}
+										final long f = freed;
+										uiPost(new Runnable() {
+											public void run() {
+												DexItem.clearCache();
+												listCache.clear();
+												refresh(); // MEGA archives that were open close, they download again on the next tap
+												showCacheSize(s);
+												toast("Cache cleared: " + human(f) + " freed");
+											}
+										});
+									}
+								}).start();
+							}
+						}).setNegativeButton("Cancel", null).show();
+			}
+		});
+		return row;
+	}
+
+	void showCacheSize(final TextView s) {
+		new Thread(new Runnable() {
+			public void run() {
+				long n = 0;
+				try {
+					n = CacheCleaner.size(getCacheDir());
+				} catch (Throwable e) {
+				}
+				final String text = "Cache: " + human(n) + ". Files older than 3 days are removed automatically.";
+				uiPost(new Runnable() {
+					public void run() {
+						s.setText(text);
+					}
+				});
+			}
+		}).start();
 	}
 
 	View megaToggleRow() {
@@ -2380,10 +2471,42 @@ public class MainActivity extends Activity {
 		String p = f.getAbsolutePath();
 		if (opened.contains(p))
 			opened.remove(p);
-		else
+		else {
+			collapseSiblings(f, opened); // only one folder per tree level stays open
 			opened.add(p);
+		}
 		markSelected(f, left);
 		refreshPane(left);
+	}
+
+	/** opening a folder closes the other open folders at the same level (and everything that was open below them) */
+	void collapseSiblings(File f, HashSet<String> opened) {
+		if (isPaneRoot(f))
+			return; // storage roots and MEGA accounts can stay open side by side
+		File parent = f.getParentFile();
+		if (parent == null)
+			return;
+		File[] sib = children(parent);
+		if (sib == null)
+			return;
+		String me = f.getAbsolutePath();
+		for (int i = 0; i < sib.length; i++) {
+			String sp = sib[i].getAbsolutePath();
+			if (!sp.equals(me) && opened.contains(sp))
+				removeOpenedUnder(opened, sp);
+		}
+	}
+
+	void removeOpenedUnder(HashSet<String> opened, String base) {
+		ArrayList<String> gone = new ArrayList<String>();
+		for (String o : opened) {
+			if (o.equals(base))
+				gone.add(o);
+			else if (o.length() > base.length() && o.startsWith(base)
+					&& (o.charAt(base.length()) == '/' || o.charAt(base.length()) == '!'))
+				gone.add(o);
+		}
+		opened.removeAll(gone);
 	}
 
 	/** 123GB, and 1.8TB once it is more than a terabyte */
@@ -3296,7 +3419,7 @@ public class MainActivity extends Activity {
 	void showSortMenu(final boolean left) {
 		int curMode = left ? leftSort : rightSort;
 		boolean curRev = left ? leftSortRev : rightSortRev;
-		final String[] labels = {"Name", "Name (Z\u2192A)", "Size (small\u2192large)", "Size (large\u2192small)",
+		final String[] labels = {"Name(A\u2192Z)", "Name (Z\u2192A)", "Size (small\u2192large)", "Size (large\u2192small)",
 				"Date modified (old\u2192new)", "Date modified (new\u2192old)",
 				"Type (A\u2192Z)", "Type (Z\u2192A)"};
 		int checked;
