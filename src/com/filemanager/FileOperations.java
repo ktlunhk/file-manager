@@ -25,26 +25,33 @@ class FileOperations {
         j.start();
     }
 
+    /** local files, and items of another MEGA account, are sent into a folder of the account dstDir belongs to */
     void startUploadToMega(ArrayList<File> srcs, MegaItem dstDir, boolean move) {
-        new MegaUpJob(srcs, dstDir.handle, move).start();
+        new MegaUpJob(srcs, dstDir.acc, dstDir.handle, move).start();
     }
 
     class MegaUpJob {
         final ArrayList<File> srcs;
+        final MegaClient acc; // the account that receives the files
         final String parent;
-        final boolean move; // delete the local file after it was uploaded
+        final boolean move; // delete the source after it was uploaded (a MEGA source goes to its Rubbish Bin)
+        final boolean fromMega; // at least one source lives in another MEGA account: its data is streamed, nothing is saved
         volatile boolean cancelled;
         volatile long done, total;
         volatile String cur = "Preparing...";
-        int uploaded, skipped;
+        int uploaded, skipped, moveFail;
         long lastUi;
         OperationProgress operationProgress;
         final Runnable updater;
 
-        MegaUpJob(ArrayList<File> srcs, String parent, boolean move) {
+        MegaUpJob(ArrayList<File> srcs, MegaClient acc, String parent, boolean move) {
             this.srcs = srcs;
+            this.acc = acc;
             this.parent = parent;
             this.move = move;
+            boolean fm = false;
+            for (int i = 0; i < srcs.size(); i++) if (srcs.get(i) instanceof MegaItem) fm = true;
+            this.fromMega = fm;
             updater = new Runnable() {
                 public void run() {
                     if (operationProgress == null) return;
@@ -73,7 +80,7 @@ class FileOperations {
         }
 
         void start() {
-            operationProgress = new OperationProgress(activity, "Uploading to MEGA", true, true, activity.dp, new Runnable() {
+            operationProgress = new OperationProgress(activity, fromMega ? "Copying to MEGA" : "Uploading to MEGA", true, true, activity.dp, new Runnable() {
                 public void run() {
                     cancelled = true;
                     cur = "Cancelling...";
@@ -101,17 +108,17 @@ class FileOperations {
             if (cancelled) throw new InterruptedIOException("Cancelled");
             String name = f.getName();
             if (f.isDirectory()) {
-                String h = MegaClient.child(parentHandle, name, true);
-                if (h == null) h = MegaClient.makeFolder(name, parentHandle);
+                String h = acc.child(parentHandle, name, true);
+                if (h == null) h = acc.makeFolder(name, parentHandle);
                 File[] c = f.listFiles();
                 if (c != null) for (int i = 0; i < c.length; i++) upload(c[i], h);
                 if (move) {
                     File[] left = f.listFiles();
-                    if (left != null && left.length == 0) f.delete();
+                    if (left != null && left.length == 0) removeSource(f);
                 }
                 return;
             }
-            if (MegaClient.child(parentHandle, name, false) != null) {
+            if (acc.child(parentHandle, name, false) != null) {
                 skipped++;
                 done += Math.max(f.length(), 0L);
                 tick(false);
@@ -119,15 +126,42 @@ class FileOperations {
             }
             cur = name;
             tick(true);
-            MegaClient.uploadFile(f, parentHandle, new MegaClient.Progress() {
+            MegaClient.Progress pg = new MegaClient.Progress() {
                 public void bytes(long n) throws IOException {
                     if (cancelled) throw new InterruptedIOException("Cancelled");
                     done += n;
                     tick(false);
                 }
-            });
+            };
+            if (f instanceof MegaItem) {
+                // another MEGA account: the download of the source is decrypted and encrypted again on the fly
+                MegaItem mi = (MegaItem) f;
+                InputStream in = mi.openStream();
+                try {
+                    acc.uploadStream(in, name, mi.length(), parentHandle, pg);
+                } finally {
+                    try {
+                        in.close();
+                    } catch (IOException e) {
+                    }
+                }
+            } else
+                acc.uploadFile(f, parentHandle, pg);
             uploaded++;
-            if (move) f.delete();
+            if (move) removeSource(f);
+        }
+
+        void removeSource(File f) {
+            if (f instanceof MegaItem) {
+                MegaItem mi = (MegaItem) f;
+                if (mi.isSystemNode()) return;
+                try {
+                    mi.acc.trashOrDelete(mi.handle);
+                } catch (IOException e) {
+                    moveFail++;
+                }
+            } else
+                f.delete();
         }
 
         void finish(final String err) {
@@ -140,19 +174,25 @@ class FileOperations {
                     String msg;
                     if (err != null) msg = "Error: " + err;
                     else if (cancelled) msg = "Cancelled";
-                    else msg = (move ? "Moved " : "Uploaded ") + uploaded + (uploaded == 1 ? " file" : " files")
-                            + (skipped > 0 ? ", skipped " + skipped + " already in MEGA" : "");
+                    else msg = (move ? "Moved " : fromMega ? "Copied " : "Uploaded ") + uploaded + (uploaded == 1 ? " file" : " files")
+                            + (skipped > 0 ? ", skipped " + skipped + " already in MEGA" : "")
+                            + (moveFail > 0 ? ", " + moveFail + " could not be removed from the source" : "");
                     activity.selected = null;
                     activity.exitMulti();
                     activity.listCache.clear();
                     activity.refresh();
                     activity.toast(msg);
+                    activity.refreshMegaQuota();
                 }
             });
         }
     }
 
     void startTransferToZip(ArrayList<File> srcs, boolean move, String title, String verb, ZipItem dstZip) {
+        if (ZipItem.fromMega(dstZip.zip)) {
+            activity.toast(ZipItem.MEGA_READ_ONLY);
+            return;
+        }
         if (ZipItem.isTar(dstZip.zip)) {
             activity.toast("tar archives are read-only");
             return;
@@ -374,7 +414,7 @@ class FileOperations {
 					File[] left = s.listFiles();
 					if (left != null && left.length == 0) {
 						try {
-							MegaClient.trashOrDelete(((MegaItem) s).handle);
+							((MegaItem) s).acc.trashOrDelete(((MegaItem) s).handle);
 						} catch (IOException e) {
 							moveFail++;
 						}
@@ -405,7 +445,7 @@ class FileOperations {
 					moveFail++;
 			} else if (move && s instanceof MegaItem) {
 				try {
-					MegaClient.trashOrDelete(((MegaItem) s).handle);
+					((MegaItem) s).acc.trashOrDelete(((MegaItem) s).handle);
 				} catch (IOException e) {
 					moveFail++;
 				}
