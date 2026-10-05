@@ -21,6 +21,8 @@ class PEntry {
 	long size, csize, time = -1, localOff, crc;
 	int flags, method, dosTime, aesStrength, aesMethod;
 	boolean aes;
+	boolean tar; // entry of a tar / tar.gz archive
+	long tarOff; // data offset inside the (uncompressed) tar stream
 	ZipEntry ze; // set only when java.util.zip handles the archive (zip64)
 
 	public String getName() {
@@ -72,14 +74,240 @@ class PZip implements Closeable {
 	private final ArrayList<PEntry> list = new ArrayList<PEntry>();
 	private final HashMap<String, PEntry> map = new HashMap<String, PEntry>();
 
+	private boolean tarMode, tarGz;
+
+	static boolean isTarName(String n) {
+		n = n.toLowerCase(Locale.US);
+		return n.endsWith(".tar") || n.endsWith(".tar.gz") || n.endsWith(".tgz");
+	}
+
 	PZip(File f) throws IOException {
 		file = f;
+		if (isTarName(f.getName())) {
+			tarMode = true;
+			parseTar();
+			return;
+		}
 		try {
 			parse();
 		} catch (Zip64Signal z) {
 			list.clear();
 			map.clear();
 			loadDelegate();
+		}
+	}
+
+	// ---------- tar / tar.gz (read-only) ----------
+	private InputStream openTarStream() throws IOException {
+		InputStream in = new BufferedInputStream(new FileInputStream(file), 65536);
+		if (tarGz) {
+			try {
+				in = new GZIPInputStream(in, 65536);
+			} catch (IOException x) {
+				in.close();
+				throw x;
+			}
+		}
+		return in;
+	}
+
+	/** reads buf.length bytes; false when the stream ended before the first byte */
+	private static boolean readFull(InputStream in, byte[] buf) throws IOException {
+		int off = 0;
+		while (off < buf.length) {
+			int n = in.read(buf, off, buf.length - off);
+			if (n < 0) {
+				if (off == 0)
+					return false;
+				throw new EOFException("Truncated archive");
+			}
+			off += n;
+		}
+		return true;
+	}
+
+	private static void skipFully(InputStream in, long n) throws IOException {
+		while (n > 0) {
+			long k = in.skip(n);
+			if (k <= 0) {
+				if (in.read() < 0)
+					throw new EOFException("Truncated archive");
+				k = 1;
+			}
+			n -= k;
+		}
+	}
+
+	private static String tarStr(byte[] b, int off, int len) {
+		int end = off;
+		while (end < off + len && b[end] != 0)
+			end++;
+		try {
+			return new String(b, off, end - off, "UTF-8");
+		} catch (UnsupportedEncodingException e) {
+			return new String(b, off, end - off);
+		}
+	}
+
+	private static long tarNum(byte[] b, int off, int len) {
+		if ((b[off] & 0x80) != 0) { // base-256 number (huge files)
+			long v = b[off] & 0x7f;
+			for (int i = 1; i < len; i++)
+				v = (v << 8) | (b[off + i] & 0xff);
+			return v;
+		}
+		long v = 0;
+		for (int i = off; i < off + len; i++) {
+			int c = b[i];
+			if (c >= '0' && c <= '7')
+				v = v * 8 + (c - '0');
+			else if (v > 0 || c == 0)
+				break;
+		}
+		return v;
+	}
+
+	private void parseTar() throws IOException {
+		InputStream raw = new FileInputStream(file);
+		int b1, b2;
+		try {
+			b1 = raw.read();
+			b2 = raw.read();
+		} finally {
+			raw.close();
+		}
+		tarGz = b1 == 0x1f && b2 == 0x8b;
+		InputStream in = openTarStream();
+		try {
+			byte[] h = new byte[512];
+			long pos = 0;
+			String longName = null, paxPath = null;
+			long paxSize = -1;
+			while (readFull(in, h)) {
+				pos += 512;
+				boolean zero = true;
+				for (int i = 0; i < 512; i++)
+					if (h[i] != 0) {
+						zero = false;
+						break;
+					}
+				if (zero)
+					break;
+				String name = tarStr(h, 0, 100);
+				long size = tarNum(h, 124, 12);
+				long mtime = tarNum(h, 136, 12);
+				int type = h[156] & 0xff;
+				if (type == 0)
+					type = '0';
+				if (h[257] == 'u' && h[258] == 's' && h[259] == 't' && h[260] == 'a' && h[261] == 'r' && h[262] == 0) {
+					String prefix = tarStr(h, 345, 155);
+					if (prefix.length() > 0)
+						name = prefix + "/" + name;
+				}
+				if (type == 'L' || type == 'x' || type == 'g') {
+					if (size > 1024 * 1024)
+						throw new IOException("Unsupported tar header");
+					byte[] data = new byte[(int) size];
+					if (size > 0)
+						readFull(in, data);
+					long padded = (size + 511) / 512 * 512;
+					skipFully(in, padded - size);
+					pos += padded;
+					if (type == 'L') {
+						longName = tarStr(data, 0, data.length);
+					} else if (type == 'x') {
+						String txt = new String(data, "UTF-8");
+						String[] lines = txt.split("\n");
+						for (int i = 0; i < lines.length; i++) {
+							int sp = lines[i].indexOf(' ');
+							int eq = lines[i].indexOf('=');
+							if (sp < 0 || eq < sp)
+								continue;
+							String key = lines[i].substring(sp + 1, eq), val = lines[i].substring(eq + 1);
+							if (key.equals("path"))
+								paxPath = val;
+							else if (key.equals("size"))
+								try {
+									paxSize = Long.parseLong(val.trim());
+								} catch (NumberFormatException x) {
+								}
+						}
+					}
+					continue;
+				}
+				if (longName != null)
+					name = longName;
+				if (paxPath != null)
+					name = paxPath;
+				if (paxSize >= 0)
+					size = paxSize;
+				longName = null;
+				paxPath = null;
+				paxSize = -1;
+				boolean isDir = type == '5' || name.endsWith("/");
+				boolean isFile = type == '0' || type == '7';
+				if (type == '1' || type == '2' || type == '3' || type == '4' || type == '6')
+					size = 0; // links and devices carry no data
+				while (name.startsWith("./"))
+					name = name.substring(2);
+				while (name.startsWith("/"))
+					name = name.substring(1);
+				if ((isDir || isFile) && name.length() > 0 && !name.equals(".")) {
+					if (isDir && !name.endsWith("/"))
+						name = name + "/";
+					PEntry e = new PEntry();
+					e.name = name;
+					e.size = isDir ? 0 : size;
+					e.csize = e.size;
+					e.time = mtime * 1000L;
+					e.tar = true;
+					e.tarOff = pos;
+					list.add(e);
+					map.put(name, e);
+				}
+				long padded = (size + 511) / 512 * 512;
+				skipFully(in, padded);
+				pos += padded;
+			}
+		} catch (EOFException x) {
+			// truncated archive: show what was readable
+		} finally {
+			try {
+				in.close();
+			} catch (IOException x) {
+			}
+		}
+	}
+
+	private static class TarLimit extends InputStream {
+		private final InputStream in;
+		private long left;
+
+		TarLimit(InputStream in, long len) {
+			this.in = in;
+			this.left = len;
+		}
+
+		public int read() throws IOException {
+			if (left <= 0)
+				return -1;
+			int c = in.read();
+			if (c >= 0)
+				left--;
+			return c;
+		}
+
+		public int read(byte[] b, int off, int len) throws IOException {
+			if (left <= 0)
+				return -1;
+			int n = in.read(b, off, (int) Math.min(len, left));
+			if (n > 0)
+				left -= n;
+			return n;
+		}
+
+		public void close() throws IOException {
+			in.close();
 		}
 	}
 
@@ -196,6 +424,16 @@ class PZip implements Closeable {
 	}
 
 	InputStream open(PEntry e, String pw) throws IOException {
+		if (e.tar) {
+			InputStream tin = openTarStream();
+			try {
+				skipFully(tin, e.tarOff);
+			} catch (IOException x) {
+				tin.close();
+				throw x;
+			}
+			return new TarLimit(tin, e.size);
+		}
 		if (del != null)
 			return del.getInputStream(e.ze);
 		RandomAccessFile r = new RandomAccessFile(file, "r");
