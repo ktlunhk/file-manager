@@ -58,7 +58,7 @@ class FileOperations {
             long now = System.currentTimeMillis();
             if (!force && now - lastUi < 100) return;
             lastUi = now;
-            activity.runOnUiThread(updater);
+            activity.uiPost(updater);
         }
 
         long sizeOf(File f) throws IOException {
@@ -131,7 +131,7 @@ class FileOperations {
         }
 
         void finish(final String err) {
-            activity.runOnUiThread(new Runnable() {
+            activity.uiPost(new Runnable() {
                 public void run() {
                     try {
                         if (operationProgress != null) operationProgress.dismiss();
@@ -153,6 +153,10 @@ class FileOperations {
     }
 
     void startTransferToZip(ArrayList<File> srcs, boolean move, String title, String verb, ZipItem dstZip) {
+        if (ZipItem.isTar(dstZip.zip)) {
+            activity.toast("tar archives are read-only");
+            return;
+        }
         Job j = new Job(srcs, new ArrayList<File>(), move, title, verb);
         j.dstZip = dstZip;
         j.start();
@@ -179,7 +183,7 @@ class FileOperations {
 				for (int i = 0; i < targets.size() && !progress.cancelled; i++)
 					deleteWithProgress(targets.get(i), done, total[0], progress);
 				final boolean cancelled = progress.cancelled;
-				activity.runOnUiThread(new Runnable() {
+				activity.uiPost(new Runnable() {
 					public void run() {
 						progress.dismiss();
 						activity.lastTrashBatch = null; activity.hideUndoBar(); activity.refresh();
@@ -211,7 +215,7 @@ class FileOperations {
 		done[0]++;
 		final long d = done[0];
 		final String name = f.getName();
-		activity.runOnUiThread(new Runnable() {
+		activity.uiPost(new Runnable() {
 			public void run() {
 				int pct = total > 0 ? (int) (d * 100L / total) : 100;
 				progress.update(name, d, total, pct + "%   " + d + " / " + total + " items");
@@ -332,7 +336,7 @@ class FileOperations {
 			if (!force && now - lastUi < 100)
 				return;
 			lastUi = now;
-			activity.runOnUiThread(updater);
+			activity.uiPost(updater);
 		}
 
 		long sizeOf(File f) throws IOException {
@@ -486,7 +490,11 @@ class FileOperations {
 				return false;
 			final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
 			final int[] choice = {0}; // 1 overwrite, 2 skip, 3 cancel
-			activity.runOnUiThread(new Runnable() {
+			if (activity.isFinishing()) { // screen was recreated: the dialog cannot be shown
+				cancelled = true;
+				return false;
+			}
+			activity.uiPost(new Runnable() {
 				public void run() {
 					String msg = "\"" + name + "\" already exists" + (where != null ? " in " + where : "") + ".\n\n"
 							+ "Existing: " + exInfo + "\nNew: " + newInfo + "\n\nOverwrite?";
@@ -495,8 +503,12 @@ class FileOperations {
 					activity.themeDialogView(all);
 					all.setText("Apply to all (" + files + " files)");
 					b.setCancelable(false);
-					if (files > 1)
-						b.setView(all);
+					if (files > 1) {
+						android.widget.FrameLayout allBox = new android.widget.FrameLayout(b.getContext());
+						activity.padDialogBox(allBox);
+						allBox.addView(all, new android.widget.FrameLayout.LayoutParams(-1, -2));
+						b.setView(allBox);
+					}
 					DialogInterface.OnClickListener l = new DialogInterface.OnClickListener() {
 						public void onClick(DialogInterface di, int which) {
 							if (which == DialogInterface.BUTTON_POSITIVE)
@@ -769,7 +781,7 @@ class FileOperations {
 		}
 
 		void finish(final String err) {
-			activity.runOnUiThread(new Runnable() {
+			activity.uiPost(new Runnable() {
 				public void run() {
 					try {
 						if (operationProgress != null)
@@ -818,6 +830,7 @@ class FileOperations {
 		volatile int done, total, failed;
 		volatile String cur = "Preparing...";
 		long lastUi;
+		String firstFail;
 		OperationProgress operationProgress;
 		final Runnable updater;
 
@@ -849,8 +862,11 @@ class FileOperations {
 						tick(true);
 						ArrayList<File[]> res = moveToTrash(one(f));
 						moved.addAll(res);
-						if (res.get(0)[1] == null)
+						if (res.get(0)[1] == null) {
 							failed++;
+							if (firstFail == null)
+								firstFail = f.getName();
+						}
 						done++;
 						tick(false);
 					}
@@ -864,11 +880,11 @@ class FileOperations {
 			if (!force && now - lastUi < 100)
 				return;
 			lastUi = now;
-			activity.runOnUiThread(updater);
+			activity.uiPost(updater);
 		}
 
 		void finish(final ArrayList<File[]> moved) {
-			activity.runOnUiThread(new Runnable() {
+			activity.uiPost(new Runnable() {
 				public void run() {
 					try {
 						if (operationProgress != null)
@@ -880,7 +896,7 @@ class FileOperations {
 					if (cancelled)
 						msg = "Cancelled (" + ok + " moved to trash)";
 					else if (failed > 0)
-						msg = "Moved " + ok + " to trash, " + failed + " could not be trashed";
+						msg = "Moved " + ok + " to trash, " + failed + " could not be trashed" + (firstFail != null ? " (" + firstFail + ")" : "");
 					else
 						msg = "Moved " + done + (done == 1 ? " item" : " items") + " to trash";
 					if (ok > 0)
