@@ -11,6 +11,7 @@ class ZipItem extends File {
 	final long size, time;
 	boolean nested; // a zip/apk/jar stored inside another zip: browsable as a folder
 	static File cacheDir;
+	static volatile String lastError; // why the last archive listing failed, shown once by the UI
 
 	ZipItem(File zip, String entry, boolean dir, long size, long time) {
 		super(zip.getAbsolutePath() + "!/" + entry);
@@ -149,7 +150,8 @@ class ZipItem extends File {
 				}
 			}
 		} catch (Exception e) {
-			// unreadable / corrupt zip: show as empty
+			// unreadable / corrupt archive: show as empty and tell the user why
+			lastError = "Cannot read " + zip.getName() + ": " + (e.getMessage() == null ? e.toString() : e.getMessage());
 		} finally {
 			if (zf != null)
 				try {
@@ -187,7 +189,13 @@ class ZipItem extends File {
 
 	static boolean isZipName(String n) {
         n = n.toLowerCase(Locale.US);
-        return n.endsWith(".zip") || n.endsWith(".jar") || n.endsWith(".apk");
+        return n.endsWith(".zip") || n.endsWith(".jar") || n.endsWith(".apk")
+                || n.endsWith(".tar") || n.endsWith(".tar.gz") || n.endsWith(".tgz");
+    }
+
+    /** tar archives can be browsed and extracted but not changed */
+    static boolean isTar(File f) {
+        return f != null && PZip.isTarName(f.getName());
     }
 
     static boolean isZipRoot(File f) {
@@ -204,7 +212,7 @@ class ZipItem extends File {
         else if (action == 3) a.ask("Rename", "New name", 3);
         else if (action == 5) a.delConfirm();
         else if (action == 7) a.info();
-        else a.toast("Zip contents are read-only. Use Copy to extract first.");
+        else a.toast("Archive contents are read-only. Use Copy to extract first.");
     }
 
     static void extract(ZipItem zi, File dst) throws IOException {
@@ -246,7 +254,7 @@ class ZipItem extends File {
             try { rewriteZip(zip, entry, newName); msg = okMsg; }
             catch (Exception e) { msg = "Zip error: " + e.getMessage(); }
             final String m = msg;
-            a.runOnUiThread(new Runnable() { public void run() {
+            a.uiPost(new Runnable() { public void run() {
                 try { wait.dismiss(); } catch (Exception e) {}
                 a.toast(m); a.refresh();
             }});
@@ -254,6 +262,7 @@ class ZipItem extends File {
     }
 
     static void rewriteZip(File zip, String entry, String newName) throws IOException {
+        if (isTar(zip)) throw new IOException("tar archives are read-only");
         if (PZip.needsPassword(zip)) throw new IOException("Editing password-protected zips is not supported");
         File tmp = new File(zip.getParentFile(), zip.getName() + ".tmp");
         PZip zf = null; ZipOutputStream zo = null; boolean ok = false;
@@ -319,7 +328,7 @@ class ZipItem extends File {
             String msg = okMsg;
             try { deleteGrouped(items); } catch (Exception e) { msg = "Zip error: " + e.getMessage(); }
             final String m = msg;
-            a.runOnUiThread(new Runnable() { public void run() {
+            a.uiPost(new Runnable() { public void run() {
                 try { wait.dismiss(); } catch (Exception e) {}
                 a.exitMulti(); a.toast(m); a.refresh();
             }});
@@ -332,7 +341,7 @@ class ZipItem extends File {
             String err = null;
             try { deleteGrouped(zipEntries); } catch (Exception e) { err = "Zip error: " + e.getMessage(); }
             final String zerr = err;
-            a.runOnUiThread(new Runnable() { public void run() {
+            a.uiPost(new Runnable() { public void run() {
                 try { wait.dismiss(); } catch (Exception e) {}
                 if (zerr != null) a.toast(zerr);
                 a.selected = null; a.fileOperations.deleteToTrash(normal);
@@ -372,8 +381,8 @@ class ZipItem extends File {
             if (md.isRootNode()) { a.toast("Open a MEGA folder (for example Cloud Drive) first"); return; }
             if (!MegaClient.isReady()) { a.toast("Connect to MEGA first"); return; }
             File tmpDir = new File(a.getCacheDir(), "mega-zip"); tmpDir.mkdirs();
-            askZipOptions(a, items, new File(tmpDir, MegaClient.freeName(md.handle, base, ".zip")), md.handle);
-        } else askZipOptions(a, items, a.uniqueFile(dstDir, base, ".zip"), null);
+            askZipOptions(a, items, new File(tmpDir, MegaClient.freeName(md.handle, base, ".zip")), md.handle, base);
+        } else askZipOptions(a, items, a.uniqueFile(dstDir, base, ".zip"), null, base);
     }
 
     static void zip(MainActivity a) {
@@ -386,14 +395,31 @@ class ZipItem extends File {
     }
 
     // ---------- password protected zips ----------
-    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out) {
-        askZipOptions(a, items, out, null);
-    }
+    static final String[] FMT_EXT = {".zip", ".tar", ".tar.gz"};
 
-    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final String megaParent) {
+    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final String megaParent, final String base) {
         android.widget.LinearLayout box = new android.widget.LinearLayout(a);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
         a.padDialogBox(box);
+        final android.widget.TextView target = new android.widget.TextView(a);
+        target.setText(out.getName());
+        target.setTextSize(14);
+        target.setSingleLine(true);
+        target.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        target.setPadding(0, 0, 0, 8 * a.dp);
+        box.addView(target, new android.widget.LinearLayout.LayoutParams(-1, -2));
+        final android.widget.RadioGroup fmtGroup = new android.widget.RadioGroup(a);
+        fmtGroup.setOrientation(android.widget.RadioGroup.HORIZONTAL);
+        String[] fmtLabel = {"Zip", "Tar", "Tar.gz (gzip)"};
+        for (int i = 0; i < fmtLabel.length; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(a);
+            rb.setText(fmtLabel[i]);
+            rb.setId(1000 + i);
+            rb.setTextSize(14);
+            fmtGroup.addView(rb, new android.widget.RadioGroup.LayoutParams(-2, -2));
+        }
+        fmtGroup.check(1000); // zip is the default
+        box.addView(fmtGroup, new android.widget.LinearLayout.LayoutParams(-1, -2));
         final android.widget.EditText pw = new android.widget.EditText(a);
         a.alignInput(pw);
         pw.setHint("Password (leave empty for none)");
@@ -405,11 +431,33 @@ class ZipItem extends File {
         aes.setTextSize(12);
         aes.setChecked(true);
         box.addView(aes, new android.widget.LinearLayout.LayoutParams(-1, -2));
-        a.createDialog("Create ZIP", out.getName()).setView(box)
+        a.themeDialogView(box);
+        // password and encryption exist only for zip; tar formats have no encryption
+        fmtGroup.setOnCheckedChangeListener(new android.widget.RadioGroup.OnCheckedChangeListener() {
+            public void onCheckedChanged(android.widget.RadioGroup g, int id) {
+                int f = id - 1000;
+                target.setText(f == 0 ? out.getName() : base + FMT_EXT[f]);
+                int vis = f == 0 ? android.view.View.VISIBLE : android.view.View.GONE;
+                pw.setVisibility(vis);
+                aes.setVisibility(vis);
+            }
+        });
+        android.widget.ScrollView outer = new android.widget.ScrollView(a);
+        outer.addView(box);
+        a.createDialog("Create archive", null).setView(outer)
             .setPositiveButton("Create", new android.content.DialogInterface.OnClickListener() {
                 public void onClick(android.content.DialogInterface d, int w) {
-                    String p = pw.getText().toString();
-                    zipItems(a, items, out, p.length() > 0 ? p : null, aes.isChecked(), megaParent);
+                    int fmt = fmtGroup.getCheckedRadioButtonId() - 1000;
+                    if (fmt < 0 || fmt > 2) fmt = 0;
+                    if (fmt == 0) {
+                        String p = pw.getText().toString();
+                        zipItems(a, items, out, p.length() > 0 ? p : null, aes.isChecked(), megaParent);
+                        return;
+                    }
+                    File target2;
+                    if (megaParent != null) target2 = new File(out.getParentFile(), MegaClient.freeName(megaParent, base, FMT_EXT[fmt]));
+                    else target2 = a.uniqueFile(out.getParentFile(), base, FMT_EXT[fmt]);
+                    tarItems(a, items, target2, fmt == 2, megaParent);
                 }
             }).setNegativeButton("Cancel", null).show();
     }
@@ -424,7 +472,7 @@ class ZipItem extends File {
                 if (need) { String pw = PZip.getPassword(cf); if (pw != null && PZip.verifyPassword(cf, pw)) need = false; }
             }
             final boolean n = need; final File fcf = cf;
-            a.runOnUiThread(new Runnable() { public void run() {
+            a.uiPost(new Runnable() { public void run() {
                 if (!n) ok.run(); else askPassword(a, fcf, ok, false);
             }});
         }}).start();
@@ -445,7 +493,7 @@ class ZipItem extends File {
                     final String p = pw.getText().toString();
                     new Thread(new Runnable() { public void run() {
                         final boolean good = PZip.verifyPassword(cf, p);
-                        a.runOnUiThread(new Runnable() { public void run() {
+                        a.uiPost(new Runnable() { public void run() {
                             if (good) { PZip.setPassword(cf, p); a.listCache.clear(); ok.run(); }
                             else askPassword(a, cf, ok, true);
                         }});
@@ -496,11 +544,56 @@ class ZipItem extends File {
                 out.delete(); msg = "Zip error: " + e.getMessage();
             }
             final String m = msg;
-            a.runOnUiThread(new Runnable() { public void run() {
+            a.uiPost(new Runnable() { public void run() {
                 try { wait.dismiss(); } catch (Exception e) {}
                 a.exitMulti(); a.toast(m); a.refresh();
             }});
         }}).start();
+    }
+
+    static void tarItems(final MainActivity a, final ArrayList<File> items, final File out, final boolean gz, final String megaParent) {
+        final android.app.AlertDialog wait = a.busyDialog("Creating archive", out.getName());
+        new Thread(new Runnable() { public void run() {
+            String msg; TarWriter tw = null;
+            try {
+                OutputStream os = new BufferedOutputStream(new FileOutputStream(out), 65536);
+                if (gz) os = new GZIPOutputStream(os, 65536);
+                tw = new TarWriter(os);
+                HashSet<String> used = new HashSet<String>();
+                for (int i = 0; i < items.size(); i++) {
+                    File f = items.get(i); String nm = f.getName(); int k = 2;
+                    while (used.contains(nm)) { nm = f.getName() + " (" + k + ")"; k++; }
+                    used.add(nm); addTar(tw, f, nm, out);
+                }
+                tw.close(); tw = null; msg = "Created " + out.getName();
+                if (megaParent != null) {
+                    MegaClient.uploadFile(out, megaParent, new MegaClient.Progress() { public void bytes(long n) {} });
+                    out.delete();
+                    msg = "Created " + out.getName() + " in MEGA";
+                }
+            } catch (Exception e) {
+                if (tw != null) try { tw.close(); } catch (IOException x) {}
+                out.delete(); msg = "Archive error: " + (e.getMessage() == null ? e.toString() : e.getMessage());
+            }
+            final String m = msg;
+            a.uiPost(new Runnable() { public void run() {
+                try { wait.dismiss(); } catch (Exception e) {}
+                a.exitMulti(); a.toast(m); a.refresh();
+            }});
+        }}).start();
+    }
+
+    static void addTar(TarWriter tw, File f, String entry, File skip) throws IOException {
+        if (f.equals(skip)) return;
+        if (f.isDirectory()) {
+            tw.addDir(entry + "/", f.lastModified());
+            File[] c = f.listFiles();
+            if (c != null) for (int i = 0; i < c.length; i++) addTar(tw, c[i], entry + "/" + c[i].getName(), skip);
+        } else {
+            InputStream in = null;
+            try { in = openIn(f); tw.addFile(entry, f.lastModified(), f.length(), in); }
+            finally { if (in != null) try { in.close(); } catch (IOException e) {} }
+        }
     }
 
     static InputStream openIn(File f) throws IOException {
