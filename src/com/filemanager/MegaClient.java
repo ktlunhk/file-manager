@@ -33,30 +33,38 @@ class MegaClient {
 		String attr; // decrypted attribute json, kept so a rename does not drop the other attributes
 	}
 
-	static String sid, email, uid;
-	static byte[] masterKey;
-	static volatile boolean ready;
-	static HashMap<String, Node> nodes = new HashMap<String, Node>();
-	static HashMap<String, ArrayList<String>> kids = new HashMap<String, ArrayList<String>>();
+	// one MegaClient object is one logged in MEGA account; several of them can be alive at the same time
+	String id = ""; // short key of the account, used in paths and in the saved preferences
+	String sid, email, uid;
+	byte[] masterKey;
+	volatile boolean ready;
+	volatile long usedBytes = -1, maxBytes = -1; // storage use of the account, -1 = not known yet
+	static volatile Runnable onQuota; // set by the screen: called (on a background thread) when the usage changed
+	HashMap<String, Node> nodes = new HashMap<String, Node>();
+	HashMap<String, ArrayList<String>> kids = new HashMap<String, ArrayList<String>>();
 	private static int seq = (int) (System.currentTimeMillis() % 1000000);
 
-	static boolean isReady() {
+	private static synchronized int nextSeq() {
+		return seq++;
+	}
+
+	boolean isReady() {
 		return ready;
 	}
 
-	static boolean hasSession() {
+	boolean hasSession() {
 		return sid != null && masterKey != null && uid != null;
 	}
 
-	static String statusText() {
+	String statusText() {
 		if (ready)
-			return email == null ? "Connected" : email;
+			return "Connected";
 		if (hasSession())
-			return (email == null ? "" : email + " - ") + "tap to load";
+			return "tap to load";
 		return "Tap to connect";
 	}
 
-	static synchronized Node node(String h) {
+	synchronized Node node(String h) {
 		return nodes.get(h);
 	}
 
@@ -193,7 +201,7 @@ class MegaClient {
 	}
 
 	/** one API request; returns JSONObject / String / Long, throws MegaException for negative error codes */
-	static Object api(JSONObject req) throws IOException {
+	Object api(JSONObject req) throws IOException {
 		StringBuilder ks = new StringBuilder();
 		java.util.Iterator<?> it = req.keys();
 		while (it.hasNext())
@@ -212,12 +220,12 @@ class MegaClient {
 		}
 	}
 
-	static Object api0(JSONObject req) throws IOException {
+	Object api0(JSONObject req) throws IOException {
 		String hcHeader = null;
 		int hcRounds = 0;
 		// the MEGA SDK resends the very same request (same id) when it answers 402 + X-Hashcash, so the id is
 		// taken once per call and not once per attempt
-		final String urlText = API + "?id=" + (seq++) + (sid != null ? "&sid=" + URLEncoder.encode(sid, "UTF-8") : "");
+		final String urlText = API + "?id=" + nextSeq() + (sid != null ? "&sid=" + URLEncoder.encode(sid, "UTF-8") : "");
 		try {
 			for (int attempt = 0; attempt < 4; attempt++) {
 				URL url = new URL(urlText);
@@ -293,14 +301,14 @@ class MegaClient {
 		}
 	}
 
-	static JSONObject apiObj(JSONObject req) throws IOException {
+	JSONObject apiObj(JSONObject req) throws IOException {
 		Object o = api(req);
 		if (!(o instanceof JSONObject))
 			throw bad("expected an object, got " + describe(o));
 		return (JSONObject) o;
 	}
 
-	static void login(String mail, String pw, String mfa) throws IOException {
+	void login(String mail, String pw, String mfa) throws IOException {
 		mail = mail.trim().toLowerCase(Locale.US);
 		if (mail.length() == 0 || pw.length() == 0)
 			throw new IOException("Enter your e-mail and password");
@@ -369,7 +377,7 @@ class MegaClient {
 		}
 	}
 
-	static void loadTree() throws IOException {
+	void loadTree() throws IOException {
 		step = "f";
 		try {
 			JSONObject r = apiObj(new JSONObject().put("a", "f").put("c", 1));
@@ -420,15 +428,44 @@ class MegaClient {
 				}
 				l.add(n.h);
 			}
-			synchronized (MegaClient.class) {
+			synchronized (this) {
 				nodes = nn;
 				kids = kk;
 			}
 			ready = true;
 			log("tree loaded: " + nn.size() + " nodes");
+			refreshQuota();
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
 		}
+	}
+
+	/** asks MEGA how much storage is used and how much the plan allows (a=uq) */
+	void loadQuota() {
+		try {
+			JSONObject r = apiObj(new JSONObject().put("a", "uq").put("strg", 1));
+			long used = r.optLong("cstrg", -1), max = r.optLong("mstrg", -1);
+			if (max > 0 && used >= 0) {
+				usedBytes = used;
+				maxBytes = max;
+			}
+			log("storage: " + used + " of " + max + " bytes");
+		} catch (Exception e) {
+			log("storage usage not available: " + e.getMessage());
+		}
+	}
+
+	/** loads the usage in the background and tells the screen when it is there */
+	void refreshQuota() {
+		new Thread(new Runnable() {
+			public void run() {
+				long before = usedBytes + maxBytes;
+				loadQuota();
+				Runnable r = onQuota;
+				if (r != null && usedBytes + maxBytes != before)
+					r.run();
+			}
+		}).start();
 	}
 
 	// ---------------- upload ----------------
@@ -440,7 +477,7 @@ class MegaClient {
 		return u.startsWith("http://") ? "https://" + u.substring(7) : u;
 	}
 
-	static synchronized String child(String parent, String name, boolean folder) {
+	synchronized String child(String parent, String name, boolean folder) {
 		ArrayList<String> k = kids.get(parent);
 		if (k == null)
 			return null;
@@ -452,7 +489,7 @@ class MegaClient {
 		return null;
 	}
 
-	static synchronized void addNode(String h, String parent, int t, String name, long size, long ts, byte[] key) {
+	synchronized void addNode(String h, String parent, int t, String name, long size, long ts, byte[] key) {
 		Node n = new Node();
 		n.h = h;
 		n.p = parent;
@@ -472,7 +509,7 @@ class MegaClient {
 	}
 
 	/** puts a new node under parent (a=p) and adds it to the local tree; returns its handle */
-	private static String putNode(String token, int t, String name, byte[] nodeKey, String parent, long size) throws IOException {
+	private String putNode(String token, int t, String name, byte[] nodeKey, String parent, long size) throws IOException {
 		try {
 			String attrJson = new JSONObject().put("n", name).toString();
 			String attr = MegaCrypto.encryptAttr(attrJson, nodeKey);
@@ -495,7 +532,7 @@ class MegaClient {
 		}
 	}
 
-	static String makeFolder(String name, String parent) throws IOException {
+	String makeFolder(String name, String parent) throws IOException {
 		if (!hasSession())
 			throw new IOException("Not logged in to MEGA");
 		return putNode("xxxxxxxx", 1, name, MegaCrypto.random(16), parent, 0);
@@ -582,10 +619,25 @@ class MegaClient {
 	}
 
 	/** uploads a local file into the MEGA folder `parent`; returns the new node handle */
-	static String uploadFile(File f, String parent, Progress pg) throws IOException {
+	String uploadFile(File f, String parent, Progress pg) throws IOException {
+		InputStream in = new FileInputStream(f);
+		try {
+			return uploadStream(in, f.getName(), f.length(), parent, pg);
+		} finally {
+			try {
+				in.close();
+			} catch (IOException e) {
+			}
+		}
+	}
+
+	/** uploads `size` bytes read from `in` as a new file called `name` into the MEGA folder `parent` of this account.
+	 * The data is encrypted chunk by chunk while it is read, so nothing is written to disk. This is also what moves a
+	 * file from one MEGA account to another: the source account's download() stream is the input here. The caller
+	 * closes `in`. Returns the new node handle. */
+	String uploadStream(InputStream in, String name, long size, String parent, Progress pg) throws IOException {
 		if (!hasSession())
 			throw new IOException("Not logged in to MEGA");
-		long size = f.length();
 		try {
 			step = "u";
 			JSONObject r = apiObj(new JSONObject().put("a", "u").put("ssl", 2).put("s", size));
@@ -596,46 +648,38 @@ class MegaClient {
 			byte[] nonce = MegaCrypto.random(8);
 			javax.crypto.Cipher ctr = MegaCrypto.ctrEncryptor(aesKey, nonce);
 			byte[] fileMac = new byte[16];
-			InputStream in = new FileInputStream(f);
 			String token = null;
-			try {
-				long pos = 0;
-				int chunk = 131072; // chunk sizes grow 128K, 256K ... 1M; the MAC depends on these boundaries
-				do {
-					int want = (int) Math.min((long) chunk, size - pos);
-					byte[] buf = new byte[want];
-					int got = 0;
-					while (got < want) {
-						int n = in.read(buf, got, want - got);
-						if (n < 0)
-							throw new IOException("File changed while uploading: " + f.getName());
-						got += n;
-					}
-					if (want > 0)
-						fileMac = MegaCrypto.foldMac(fileMac, MegaCrypto.chunkMac(buf, want, aesKey, nonce), aesKey);
-					byte[] enc = want > 0 ? ctr.update(buf) : buf;
-					token = postChunk(url, pos, enc, pg);
-					pos += want;
-					if (chunk < 1048576)
-						chunk += 131072;
-				} while (pos < size);
-			} finally {
-				try {
-					in.close();
-				} catch (IOException e) {
+			long pos = 0;
+			int chunk = 131072; // chunk sizes grow 128K, 256K ... 1M; the MAC depends on these boundaries
+			do {
+				int want = (int) Math.min((long) chunk, size - pos);
+				byte[] buf = new byte[want];
+				int got = 0;
+				while (got < want) {
+					int n = in.read(buf, got, want - got);
+					if (n < 0)
+						throw new IOException("File ended early or changed while copying: " + name);
+					got += n;
 				}
-			}
+				if (want > 0)
+					fileMac = MegaCrypto.foldMac(fileMac, MegaCrypto.chunkMac(buf, want, aesKey, nonce), aesKey);
+				byte[] enc = want > 0 ? ctr.update(buf) : buf;
+				token = postChunk(url, pos, enc, pg);
+				pos += want;
+				if (chunk < 1048576)
+					chunk += 131072;
+			} while (pos < size);
 			if (token == null)
 				throw new IOException("MEGA did not confirm the upload");
 			byte[] nodeKey = MegaCrypto.fileNodeKey(aesKey, nonce, fileMac);
-			return putNode(token, 0, f.getName(), nodeKey, parent, size);
+			return putNode(token, 0, name, nodeKey, parent, size);
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
 		}
 	}
 
 	// ---------------- change the tree: rename, move, delete, copy ----------------
-	static synchronized String rubbishHandle() {
+	synchronized String rubbishHandle() {
 		for (Node n : nodes.values())
 			if (n.t == 4)
 				return n.h;
@@ -643,7 +687,7 @@ class MegaClient {
 	}
 
 	/** true when h is in the Rubbish Bin (or is it) */
-	static synchronized boolean inRubbish(String h) {
+	synchronized boolean inRubbish(String h) {
 		String cur = h;
 		for (int g = 0; cur != null && cur.length() > 0 && g < 64; g++) {
 			Node n = nodes.get(cur);
@@ -657,7 +701,7 @@ class MegaClient {
 	}
 
 	/** true when h is `ancestor` itself or somewhere below it */
-	static synchronized boolean isInside(String h, String ancestor) {
+	synchronized boolean isInside(String h, String ancestor) {
 		String cur = h;
 		for (int g = 0; cur != null && cur.length() > 0 && g < 64; g++) {
 			if (cur.equals(ancestor))
@@ -668,12 +712,12 @@ class MegaClient {
 		return false;
 	}
 
-	static synchronized ArrayList<String> kidsOf(String h) {
+	synchronized ArrayList<String> kidsOf(String h) {
 		ArrayList<String> l = kids.get(h);
 		return l == null ? new ArrayList<String>() : new ArrayList<String>(l);
 	}
 
-	private static synchronized void detach(String h) {
+	private synchronized void detach(String h) {
 		Node n = nodes.get(h);
 		if (n == null)
 			return;
@@ -682,7 +726,7 @@ class MegaClient {
 			l.remove(h);
 	}
 
-	private static synchronized void dropTree(String h) {
+	private synchronized void dropTree(String h) {
 		ArrayList<String> k = kids.remove(h);
 		if (k != null)
 			for (String c : new ArrayList<String>(k))
@@ -691,7 +735,7 @@ class MegaClient {
 	}
 
 	/** a free name in `parent`: base+ext, then "base 2"+ext ... */
-	static String freeName(String parent, String base, String ext) {
+	String freeName(String parent, String base, String ext) {
 		String out = base + ext;
 		int i = 2;
 		while (child(parent, out, false) != null || child(parent, out, true) != null) {
@@ -702,7 +746,7 @@ class MegaClient {
 	}
 
 	/** "name copy.ext", "name copy 2.ext" ... that is free in `parent` */
-	static String copyName(String parent, String name, boolean folder) {
+	String copyName(String parent, String name, boolean folder) {
 		String base = name, ext = "";
 		int dot = name.lastIndexOf('.');
 		if (!folder && dot > 0) {
@@ -718,7 +762,7 @@ class MegaClient {
 		return out;
 	}
 
-	static void rename(String h, String newName) throws IOException {
+	void rename(String h, String newName) throws IOException {
 		Node n = node(h);
 		if (n == null || n.key == null)
 			throw new IOException("Cannot rename this item");
@@ -730,7 +774,7 @@ class MegaClient {
 			String k = MegaCrypto.b64e(MegaCrypto.aesEcb(n.key, masterKey, true));
 			step = "a";
 			api(new JSONObject().put("a", "a").put("n", h).put("attr", attr).put("key", k));
-			synchronized (MegaClient.class) {
+			synchronized (this) {
 				n.name = newName;
 				n.attr = json;
 			}
@@ -739,14 +783,14 @@ class MegaClient {
 		}
 	}
 
-	static void move(String h, String newParent) throws IOException {
+	void move(String h, String newParent) throws IOException {
 		try {
 			step = "m";
 			api(new JSONObject().put("a", "m").put("n", h).put("t", newParent));
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
 		}
-		synchronized (MegaClient.class) {
+		synchronized (this) {
 			Node n = nodes.get(h);
 			if (n == null)
 				return;
@@ -763,21 +807,21 @@ class MegaClient {
 	}
 
 	/** permanent delete */
-	static void remove(String h) throws IOException {
+	void remove(String h) throws IOException {
 		try {
 			step = "d";
 			api(new JSONObject().put("a", "d").put("n", h));
 		} catch (JSONException e) {
 			throw bad("JSON " + e.getMessage());
 		}
-		synchronized (MegaClient.class) {
+		synchronized (this) {
 			detach(h);
 			dropTree(h);
 		}
 	}
 
 	/** to the Rubbish Bin, or gone for good when it already is in there */
-	static void trashOrDelete(String h) throws IOException {
+	void trashOrDelete(String h) throws IOException {
 		if (inRubbish(h)) {
 			remove(h);
 			return;
@@ -789,7 +833,7 @@ class MegaClient {
 	}
 
 	/** server side copy of a file (no data is transferred); the new node gets newName */
-	static String copyFileTo(String srcH, String parent, String newName) throws IOException {
+	String copyFileTo(String srcH, String parent, String newName) throws IOException {
 		Node n = node(srcH);
 		if (n == null || n.key == null)
 			throw new IOException("Cannot copy this item");
@@ -818,7 +862,7 @@ class MegaClient {
 	}
 
 	/** copies a file or a whole folder inside MEGA under a new name */
-	static String copyTree(String srcH, String parent, String newName) throws IOException {
+	String copyTree(String srcH, String parent, String newName) throws IOException {
 		Node n = node(srcH);
 		if (n == null)
 			throw new IOException("Item not found");
@@ -834,19 +878,33 @@ class MegaClient {
 		return dir;
 	}
 
-	static void logout() {
+	/** forgets the session (it expired) but keeps the account object and its e-mail, so the same account can log in again */
+	void dropSession() {
 		sid = null;
 		masterKey = null;
 		uid = null;
-		email = null;
 		ready = false;
-		synchronized (MegaClient.class) {
+		synchronized (this) {
 			nodes = new HashMap<String, Node>();
 			kids = new HashMap<String, ArrayList<String>>();
 		}
 	}
 
-	static InputStream download(String h) throws IOException {
+	void logout() {
+		sid = null;
+		masterKey = null;
+		uid = null;
+		email = null;
+		ready = false;
+		usedBytes = -1;
+		maxBytes = -1;
+		synchronized (this) {
+			nodes = new HashMap<String, Node>();
+			kids = new HashMap<String, ArrayList<String>>();
+		}
+	}
+
+	InputStream download(String h) throws IOException {
 		Node n = node(h);
 		if (n == null || n.t != 0 || n.key == null)
 			throw new IOException("Not a downloadable file");
@@ -883,25 +941,104 @@ class MegaClient {
 		}
 	}
 
-	// ---- keep the login between app starts (stored in the app's private preferences) ----
-	static void save(android.content.SharedPreferences p) {
+	// ---- the list of all accounts ----
+	static final java.util.concurrent.CopyOnWriteArrayList<MegaClient> accounts = new java.util.concurrent.CopyOnWriteArrayList<MegaClient>();
+	private static int nextId = 1;
+
+	static MegaClient byId(String id) {
+		for (MegaClient c : accounts)
+			if (c.id.equals(id))
+				return c;
+		return null;
+	}
+
+	static MegaClient byEmail(String mail) {
+		if (mail == null)
+			return null;
+		for (MegaClient c : accounts)
+			if (c.email != null && c.email.equalsIgnoreCase(mail.trim()))
+				return c;
+		return null;
+	}
+
+	/** gives a new account its id and adds it to the list */
+	static synchronized void register(MegaClient c) {
+		if (accounts.contains(c))
+			return;
+		while (byId(String.valueOf(nextId)) != null)
+			nextId++;
+		c.id = String.valueOf(nextId++);
+		accounts.add(c);
+	}
+
+	static synchronized void unregister(MegaClient c) {
+		accounts.remove(c);
+	}
+
+	// ---- keep the logins between app starts (stored in the app's private preferences) ----
+	static void saveAll(android.content.SharedPreferences p) {
 		android.content.SharedPreferences.Editor e = p.edit();
-		if (hasSession()) {
-			e.putString("mega_sid", sid).putString("mega_mk", MegaCrypto.b64e(masterKey)).putString("mega_uid", uid)
-					.putString("mega_email", email == null ? "" : email);
-		} else {
-			e.remove("mega_sid").remove("mega_mk").remove("mega_uid").remove("mega_email");
+		// the single account preferences of older versions
+		e.remove("mega_sid").remove("mega_mk").remove("mega_uid").remove("mega_email");
+		String old = p.getString("mega_ids", "");
+		if (old.length() > 0) {
+			String[] parts = old.split(",");
+			for (int i = 0; i < parts.length; i++)
+				e.remove("mega_" + parts[i] + "_sid").remove("mega_" + parts[i] + "_mk").remove("mega_" + parts[i] + "_uid")
+						.remove("mega_" + parts[i] + "_email");
 		}
+		StringBuilder ids = new StringBuilder();
+		for (MegaClient c : accounts) {
+			if (!c.hasSession())
+				continue;
+			if (ids.length() > 0)
+				ids.append(',');
+			ids.append(c.id);
+			e.putString("mega_" + c.id + "_sid", c.sid).putString("mega_" + c.id + "_mk", MegaCrypto.b64e(c.masterKey))
+					.putString("mega_" + c.id + "_uid", c.uid).putString("mega_" + c.id + "_email", c.email == null ? "" : c.email);
+		}
+		e.putString("mega_ids", ids.toString());
+		e.putInt("mega_next", nextId);
 		e.commit();
 	}
 
-	static void restore(android.content.SharedPreferences p) {
-		String s = p.getString("mega_sid", null), m = p.getString("mega_mk", null), u = p.getString("mega_uid", null);
-		if (s == null || m == null || u == null)
+	static void restoreAll(android.content.SharedPreferences p) {
+		accounts.clear();
+		nextId = Math.max(1, p.getInt("mega_next", 1));
+		String ids = p.getString("mega_ids", null);
+		if (ids == null) {
+			// the login of an older version with a single account becomes account 1
+			String s = p.getString("mega_sid", null), m = p.getString("mega_mk", null), u = p.getString("mega_uid", null);
+			if (s == null || m == null || u == null)
+				return;
+			MegaClient c = new MegaClient();
+			c.sid = s;
+			c.masterKey = MegaCrypto.b64d(m);
+			c.uid = u;
+			c.email = p.getString("mega_email", "");
+			register(c);
 			return;
-		sid = s;
-		masterKey = MegaCrypto.b64d(m);
-		uid = u;
-		email = p.getString("mega_email", "");
+		}
+		String[] parts = ids.split(",");
+		for (int i = 0; i < parts.length; i++) {
+			String id = parts[i].trim();
+			if (id.length() == 0)
+				continue;
+			String s = p.getString("mega_" + id + "_sid", null), m = p.getString("mega_" + id + "_mk", null);
+			String u = p.getString("mega_" + id + "_uid", null);
+			if (s == null || m == null || u == null)
+				continue;
+			MegaClient c = new MegaClient();
+			c.id = id;
+			c.sid = s;
+			c.masterKey = MegaCrypto.b64d(m);
+			c.uid = u;
+			c.email = p.getString("mega_" + id + "_email", "");
+			accounts.add(c);
+			try {
+				nextId = Math.max(nextId, Integer.parseInt(id) + 1);
+			} catch (NumberFormatException e) {
+			}
+		}
 	}
 }
