@@ -10,6 +10,7 @@ class ZipItem extends File {
 	final boolean dir;
 	final long size, time;
 	boolean nested; // a zip/apk/jar stored inside another zip: browsable as a folder
+	MegaItem mega; // set when this archive is a downloaded copy of an archive that lives in MEGA
 	static File cacheDir;
 	static volatile String lastError; // why the last archive listing failed, shown once by the UI
 
@@ -32,10 +33,20 @@ class ZipItem extends File {
 	}
 	public File getParentFile() {
 		if (isRoot())
-			return zip.getParentFile();
+			return mega != null ? mega : zip.getParentFile();
 		int i = entry.lastIndexOf('/');
-		return new ZipItem(zip, i < 0 ? "" : entry.substring(0, i), true, 0, zip.lastModified());
+		ZipItem p = new ZipItem(zip, i < 0 ? "" : entry.substring(0, i), true, 0, zip.lastModified());
+		p.mega = mega;
+		return p;
 	}
+
+	/** true for the cached copy of an archive that is stored in MEGA: browse and copy out, but never change it */
+	static boolean fromMega(File zip) {
+		return zip != null && cacheDir != null
+				&& zip.getAbsolutePath().startsWith(new File(cacheDir, "mega").getAbsolutePath() + "/");
+	}
+
+	static final String MEGA_READ_ONLY = "Archives stored in MEGA are read-only. Copy the files out first.";
 	public String getParent() {
 		File p = getParentFile();
 		return p == null ? null : p.getPath();
@@ -144,6 +155,7 @@ class ZipItem extends File {
 						seen.put(cn, new DexItem(zip, fullEntry, "", true, Math.max(sz, 0L), ze.getTime()));
 					else {
 						ZipItem zi = new ZipItem(zip, fullEntry, cd, Math.max(sz, 0L), ze.getTime());
+						zi.mega = mega;
 						zi.nested = !cd && isZipName(cn);
 						seen.put(cn, zi);
 					}
@@ -248,6 +260,7 @@ class ZipItem extends File {
     }
 
     static void zipModify(final MainActivity a, final File zip, final String entry, final String newName, final String okMsg) {
+        if (fromMega(zip)) { a.toast(MEGA_READ_ONLY); return; }
         final android.app.AlertDialog wait = a.busyDialog(newName == null ? "Deleting from zip" : "Renaming in zip", zip.getName());
         new Thread(new Runnable() { public void run() {
             String msg;
@@ -323,6 +336,7 @@ class ZipItem extends File {
     }
 
     static void zipDeleteMany(final MainActivity a, final ArrayList<ZipItem> items, final String okMsg) {
+        if (!items.isEmpty() && fromMega(items.get(0).zip)) { a.toast(MEGA_READ_ONLY); return; }
         final android.app.AlertDialog wait = a.busyDialog("Deleting from zip", "Rewriting zip...");
         new Thread(new Runnable() { public void run() {
             String msg = okMsg;
@@ -336,6 +350,7 @@ class ZipItem extends File {
     }
 
     static void deleteZipEntriesThenFiles(final MainActivity a, final ArrayList<ZipItem> zipEntries, final ArrayList<File> normal) {
+        if (!zipEntries.isEmpty() && fromMega(zipEntries.get(0).zip)) { a.toast(MEGA_READ_ONLY); return; }
         final android.app.AlertDialog wait = a.busyDialog("Deleting", "Rewriting zip...");
         new Thread(new Runnable() { public void run() {
             String err = null;
@@ -379,9 +394,9 @@ class ZipItem extends File {
         if (dstDir instanceof MegaItem) {
             MegaItem md = (MegaItem) dstDir;
             if (md.isRootNode()) { a.toast("Open a MEGA folder (for example Cloud Drive) first"); return; }
-            if (!MegaClient.isReady()) { a.toast("Connect to MEGA first"); return; }
+            if (!md.isReady()) { a.toast("Connect to MEGA first"); return; }
             File tmpDir = new File(a.getCacheDir(), "mega-zip"); tmpDir.mkdirs();
-            askZipOptions(a, items, new File(tmpDir, MegaClient.freeName(md.handle, base, ".zip")), md.handle, base);
+            askZipOptions(a, items, new File(tmpDir, md.acc.freeName(md.handle, base, ".zip")), md, base);
         } else askZipOptions(a, items, a.uniqueFile(dstDir, base, ".zip"), null, base);
     }
 
@@ -397,7 +412,7 @@ class ZipItem extends File {
     // ---------- password protected zips ----------
     static final String[] FMT_EXT = {".zip", ".tar", ".tar.gz"};
 
-    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final String megaParent, final String base) {
+    static void askZipOptions(final MainActivity a, final ArrayList<File> items, final File out, final MegaItem megaParent, final String base) {
         android.widget.LinearLayout box = new android.widget.LinearLayout(a);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
         a.padDialogBox(box);
@@ -455,7 +470,7 @@ class ZipItem extends File {
                         return;
                     }
                     File target2;
-                    if (megaParent != null) target2 = new File(out.getParentFile(), MegaClient.freeName(megaParent, base, FMT_EXT[fmt]));
+                    if (megaParent != null) target2 = new File(out.getParentFile(), megaParent.acc.freeName(megaParent.handle, base, FMT_EXT[fmt]));
                     else target2 = a.uniqueFile(out.getParentFile(), base, FMT_EXT[fmt]);
                     tarItems(a, items, target2, fmt == 2, megaParent);
                 }
@@ -467,9 +482,13 @@ class ZipItem extends File {
         new Thread(new Runnable() { public void run() {
             File cf = zi.nested ? zi.nestedCopy() : zi.zip;
             boolean need = false;
-            if (cf != null) {
-                need = PZip.needsPassword(cf);
-                if (need) { String pw = PZip.getPassword(cf); if (pw != null && PZip.verifyPassword(cf, pw)) need = false; }
+            try {
+                if (cf != null) {
+                    need = PZip.needsPassword(cf);
+                    if (need) { String pw = PZip.getPassword(cf); if (pw != null && PZip.verifyPassword(cf, pw)) need = false; }
+                }
+            } catch (Throwable t) {
+                need = false; // cannot tell: go on, the listing reports a broken archive itself
             }
             final boolean n = need; final File fcf = cf;
             a.uiPost(new Runnable() { public void run() {
@@ -510,7 +529,7 @@ class ZipItem extends File {
         zipItems(a, items, out, password, aes, null);
     }
 
-    static void zipItems(final MainActivity a, final ArrayList<File> items, final File out, final String password, final boolean aes, final String megaParent) {
+    static void zipItems(final MainActivity a, final ArrayList<File> items, final File out, final String password, final boolean aes, final MegaItem megaParent) {
         final android.app.AlertDialog wait = a.busyDialog("Creating zip", out.getName());
         new Thread(new Runnable() { public void run() {
             String msg; ZipOutputStream zo = null; PZipWriter pz = null;
@@ -534,7 +553,7 @@ class ZipItem extends File {
                 }
                 if (megaParent != null) {
                     // the zip was built in the cache: send it to MEGA and remove the temp file
-                    MegaClient.uploadFile(out, megaParent, new MegaClient.Progress() { public void bytes(long n) {} });
+                    megaParent.acc.uploadFile(out, megaParent.handle, new MegaClient.Progress() { public void bytes(long n) {} });
                     out.delete();
                     msg = "Created " + out.getName() + " in MEGA";
                 }
@@ -551,7 +570,7 @@ class ZipItem extends File {
         }}).start();
     }
 
-    static void tarItems(final MainActivity a, final ArrayList<File> items, final File out, final boolean gz, final String megaParent) {
+    static void tarItems(final MainActivity a, final ArrayList<File> items, final File out, final boolean gz, final MegaItem megaParent) {
         final android.app.AlertDialog wait = a.busyDialog("Creating archive", out.getName());
         new Thread(new Runnable() { public void run() {
             String msg; TarWriter tw = null;
@@ -567,7 +586,7 @@ class ZipItem extends File {
                 }
                 tw.close(); tw = null; msg = "Created " + out.getName();
                 if (megaParent != null) {
-                    MegaClient.uploadFile(out, megaParent, new MegaClient.Progress() { public void bytes(long n) {} });
+                    megaParent.acc.uploadFile(out, megaParent.handle, new MegaClient.Progress() { public void bytes(long n) {} });
                     out.delete();
                     msg = "Created " + out.getName() + " in MEGA";
                 }
