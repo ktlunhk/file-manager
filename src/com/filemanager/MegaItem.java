@@ -3,37 +3,62 @@ package com.filemanager;
 import java.io.*;
 import java.util.*;
 
-/** A file or folder in the user's MEGA cloud, shown in the tree like a local item . */
+/** A file or folder in one MEGA account, shown in the tree like a local item. */
 class MegaItem extends File {
 	interface Done {
 		void done(File f);
 	}
 
-	final String handle; // "" = the virtual MEGA root
+	final MegaClient acc; // the account this item lives in; null only for the placeholder row shown before any login
+	final String handle; // "" = the root of the account (Cloud Drive, Inbox and Rubbish Bin are inside it)
 
-	static String pathOf(String h) {
-		if (h.length() == 0)
+	static String pathOf(MegaClient acc, String h) {
+		if (acc == null)
 			return "/mega:";
+		if (h.length() == 0)
+			return "/mega:/" + acc.id;
 		ArrayList<String> chain = new ArrayList<String>();
 		String cur = h;
 		for (int guard = 0; cur != null && cur.length() > 0 && guard < 64; guard++) {
 			chain.add(0, cur);
-			MegaClient.Node n = MegaClient.node(cur);
+			MegaClient.Node n = acc.node(cur);
 			cur = n == null ? null : n.p;
 		}
-		StringBuilder sb = new StringBuilder("/mega:");
+		StringBuilder sb = new StringBuilder("/mega:/").append(acc.id);
 		for (int i = 0; i < chain.size(); i++)
 			sb.append('/').append(chain.get(i));
 		return sb.toString();
 	}
 
-	MegaItem(String handle) {
-		super(pathOf(handle));
+	MegaItem(MegaClient acc, String handle) {
+		super(pathOf(acc, handle));
+		this.acc = acc;
 		this.handle = handle;
 	}
 
+	/** the placeholder row that is shown while no account has been added */
 	static MegaItem root() {
-		return new MegaItem("");
+		return new MegaItem(null, "");
+	}
+
+	/** the root row of one account */
+	static MegaItem rootOf(MegaClient acc) {
+		return new MegaItem(acc, "");
+	}
+
+	boolean isReady() {
+		return acc != null && acc.isReady();
+	}
+
+	String statusText() {
+		return acc == null ? "Tap to connect" : acc.statusText();
+	}
+
+	/** name shown for the root row: the e-mail tells the accounts apart */
+	String rootTitle() {
+		if (acc == null || acc.email == null || acc.email.length() == 0)
+			return "MEGA";
+		return "MEGA - " + acc.email;
 	}
 
 	/** the virtual MEGA root, Cloud Drive, Inbox and Rubbish Bin: they cannot be renamed, moved or deleted */
@@ -49,12 +74,12 @@ class MegaItem extends File {
 	}
 
 	private MegaClient.Node n() {
-		return MegaClient.node(handle);
+		return acc == null ? null : acc.node(handle);
 	}
 
 	public String getName() {
 		if (isRootNode())
-			return "MEGA";
+			return rootTitle();
 		MegaClient.Node n = n();
 		return n == null ? handle : n.name;
 	}
@@ -64,8 +89,8 @@ class MegaItem extends File {
 			return null;
 		MegaClient.Node n = n();
 		if (n == null || n.p.length() == 0)
-			return root();
-		return new MegaItem(n.p);
+			return rootOf(acc);
+		return new MegaItem(acc, n.p);
 	}
 
 	public String getParent() {
@@ -112,24 +137,26 @@ class MegaItem extends File {
 	}
 
 	public File[] listFiles() {
+		if (acc == null)
+			return new File[0];
 		ArrayList<String> hs = new ArrayList<String>();
-		synchronized (MegaClient.class) {
+		synchronized (acc) {
 			if (isRootNode()) {
-				if (!MegaClient.isReady())
+				if (!acc.isReady())
 					return new File[0];
 				for (int t = 2; t <= 4; t++)
-					for (MegaClient.Node n : MegaClient.nodes.values())
+					for (MegaClient.Node n : acc.nodes.values())
 						if (n.t == t)
 							hs.add(n.h);
 			} else {
-				ArrayList<String> k = MegaClient.kids.get(handle);
+				ArrayList<String> k = acc.kids.get(handle);
 				if (k != null)
 					hs.addAll(k);
 			}
 		}
 		File[] out = new File[hs.size()];
 		for (int i = 0; i < out.length; i++)
-			out[i] = new MegaItem(hs.get(i));
+			out[i] = new MegaItem(acc, hs.get(i));
 		return out;
 	}
 
@@ -142,6 +169,6 @@ class MegaItem extends File {
 	}
 
 	InputStream openStream() throws IOException {
-		return MegaClient.download(handle);
+		return acc.download(handle);
 	}
 }
