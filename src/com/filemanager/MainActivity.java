@@ -36,10 +36,12 @@ public class MainActivity extends Activity {
 	LinearLayout selBar;
 	TextView selCount;
 	SharedPreferences prefs;
-	static final int SORT_NAME = 0, SORT_SIZE = 1, SORT_DATE = 2;
+	static final int SORT_NAME = 0, SORT_SIZE = 1, SORT_DATE = 2, SORT_TYPE = 3;
 	int leftSort = SORT_NAME, rightSort = SORT_NAME;
 	boolean leftSortRev, rightSortRev;
 	boolean showHidden = false;
+	int leftScrollY = -1, rightScrollY = -1; // scroll position restored after the first build
+	boolean showMega = false; // MEGA cloud storage in the main screen, off by default
 	LinearLayout bodyRef;
 	LinearLayout.LayoutParams leftLpRef, rightLpRef;
 	float splitWeight = 1f; 
@@ -218,7 +220,14 @@ public class MainActivity extends Activity {
 		leftSortRev = prefs.getBoolean("leftSortRev", false);
 		rightSortRev = prefs.getBoolean("rightSortRev", false);
 		showHidden = prefs.getBoolean("showHidden", false);
+		showMega = prefs.getBoolean("showMega", false);
 		themeMode = prefs.getInt("themeMode", THEME_SYSTEM);
+		File lc = new File(prefs.getString("leftCur", ""));
+		File rc = new File(prefs.getString("rightCur", ""));
+		if (lc.getPath().length() > 0 && lc.isDirectory()) leftCur = lc;
+		if (rc.getPath().length() > 0 && rc.isDirectory()) rightCur = rc;
+		leftScrollY = prefs.getInt("leftScrollY", 0);
+		rightScrollY = prefs.getInt("rightScrollY", 0);
 		restoreOpen(leftOpen, prefs.getString("leftOpen", ""));
 		restoreOpen(rightOpen, prefs.getString("rightOpen", ""));
 		bookmarks.clear();
@@ -247,11 +256,25 @@ public class MainActivity extends Activity {
 		e.putBoolean("leftSortRev", leftSortRev);
 		e.putBoolean("rightSortRev", rightSortRev);
 		e.putBoolean("showHidden", showHidden);
+		e.putBoolean("showMega", showMega);
 		e.putInt("themeMode", themeMode);
+		if (leftTreeScroll != null) leftScrollY = leftTreeScroll.getScrollY();
+		if (rightTreeScroll != null) rightScrollY = rightTreeScroll.getScrollY();
+		e.putInt("leftScrollY", Math.max(0, leftScrollY));
+		e.putInt("rightScrollY", Math.max(0, rightScrollY));
+		e.putString("leftCur", savedCur(leftCur));
+		e.putString("rightCur", savedCur(rightCur));
 		e.putString("leftOpen", joinPaths(leftOpen));
 		e.putString("rightOpen", joinPaths(rightOpen));
 		e.putString("bookmarks", joinList(bookmarks));
 		e.apply();
+	}
+
+	/** only normal folders are remembered (not archives or cloud folders) */
+	String savedCur(File f) {
+		if (f == null || f instanceof ZipItem || f instanceof MegaItem)
+			return "";
+		return f.getAbsolutePath();
 	}
 
 	String joinPaths(HashSet<String> set) {
@@ -276,6 +299,13 @@ public class MainActivity extends Activity {
 		super.onPause();
 		volHandler.removeCallbacks(volPoll);
 		saveState();
+	}
+
+	/** background threads post here; nothing is posted once the screen is closing or recreated (rotation, theme switch) */
+	void uiPost(Runnable r) {
+		if (isFinishing() || isDestroyed())
+			return;
+		runOnUiThread(r);
 	}
 
 	protected void onDestroy() {
@@ -325,7 +355,7 @@ public class MainActivity extends Activity {
 		new Thread(new Runnable() {
 			public void run() {
 				final ArrayList<VolInfo> nv = storageVolumes();
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						volScanning = false;
 						applyVolumes(nv);
@@ -1055,7 +1085,60 @@ public class MainActivity extends Activity {
 				new LinearLayout.LayoutParams(-1, -2));
 		root.addView(themeOptionRow("Dark", "Always use the dark theme", THEME_DARK),
 				new LinearLayout.LayoutParams(-1, -2));
+
+		TextView section2 = new TextView(this);
+		section2.setText("CLOUD STORAGE");
+		section2.setTextSize(12);
+		section2.setTextColor(colTextMuted);
+		section2.setPadding(18 * dp, 18 * dp, 18 * dp, 6 * dp);
+		root.addView(section2, new LinearLayout.LayoutParams(-1, -2));
+		root.addView(megaToggleRow(), new LinearLayout.LayoutParams(-1, -2));
 		return root;
+	}
+
+	View megaToggleRow() {
+		LinearLayout row = new LinearLayout(this);
+		row.setOrientation(LinearLayout.HORIZONTAL);
+		row.setGravity(Gravity.CENTER_VERTICAL);
+		row.setPadding(18 * dp, 14 * dp, 18 * dp, 14 * dp);
+		row.setBackgroundColor(colSurface);
+		applyRipple(row);
+
+		LinearLayout textBox = new LinearLayout(this);
+		textBox.setOrientation(LinearLayout.VERTICAL);
+		TextView t = new TextView(this);
+		t.setText("Show MEGA cloud storage");
+		t.setTextSize(15);
+		t.setTextColor(colText);
+		textBox.addView(t, new LinearLayout.LayoutParams(-2, -2));
+		TextView s = new TextView(this);
+		s.setText(showMega ? "MEGA is shown in the main screen" : "MEGA is hidden from the main screen");
+		s.setTextSize(12);
+		s.setTextColor(colTextMuted);
+		textBox.addView(s, new LinearLayout.LayoutParams(-2, -2));
+		row.addView(textBox, new LinearLayout.LayoutParams(0, -2, 1));
+
+		TextView box = new TextView(this);
+		box.setText(showMega ? "\u2611" : "\u2610");
+		box.setTextSize(24);
+		box.setTextColor(showMega ? Color.rgb(45, 105, 160) : colTextMuted);
+		row.addView(box, new LinearLayout.LayoutParams(-2, -2));
+
+		row.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				showMega = !showMega;
+				if (!showMega) {
+					// a pane that is inside MEGA goes back to its normal root
+					if (leftCur instanceof MegaItem) leftCur = leftRoot;
+					if (rightCur instanceof MegaItem) rightCur = rightRoot;
+					if (selected instanceof MegaItem) selected = null;
+				}
+				saveState();
+				refresh();
+				showSettings(); // redraw the settings page with the new state
+			}
+		});
+		return row;
 	}
 
 	View themeOptionRow(String title, String subtitle, final int mode) {
@@ -1315,6 +1398,19 @@ public class MainActivity extends Activity {
 		ScrollView sv = new ScrollView(this);
 		sv.addView(list, new LinearLayout.LayoutParams(-1, -2));
 		final AlertDialog dlg = createDialog("Bookmarks", null).setView(sv)
+				.setNeutralButton("Remove all", new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface d, int w) {
+						showConfirmDialog("Remove all bookmarks", "Remove all " + bookmarks.size() + " bookmarks?",
+								"Remove all", "Cancel", new DialogInterface.OnClickListener() {
+									public void onClick(DialogInterface d2, int w2) {
+										bookmarks.clear();
+										saveState();
+										refresh(true, true, false); // stars disappear from the tree
+										toast("All bookmarks removed");
+									}
+								});
+					}
+				})
 				.setNegativeButton("Close", null).create();
 		rebuildBookmarkRows(list, dlg);
 		dlg.show();
@@ -1326,7 +1422,7 @@ public class MainActivity extends Activity {
 			TextView empty = new TextView(this);
 			empty.setText("No bookmarks left");
 			empty.setTextColor(colTextMuted);
-			empty.setPadding(20 * dp, 16 * dp, 20 * dp, 16 * dp);
+			empty.setPadding(24 * dp, 16 * dp, 24 * dp, 16 * dp);
 			list.addView(empty);
 			return;
 		}
@@ -1348,7 +1444,7 @@ public class MainActivity extends Activity {
 			LinearLayout row = new LinearLayout(this);
 			row.setOrientation(LinearLayout.HORIZONTAL);
 			row.setGravity(Gravity.CENTER_VERTICAL);
-			row.setPadding(20 * dp, 0, 8 * dp, 0);
+			row.setPadding(24 * dp, 0, 8 * dp, 0);
 
 			TextView tv = new TextView(this);
 			tv.setText(label);
@@ -1376,6 +1472,7 @@ public class MainActivity extends Activity {
 					bookmarks.remove(path);
 					saveState();
 					rebuildBookmarkRows(list, dlg);
+					refresh(true, true, false); // the star of this folder disappears from the tree
 				}
 			});
 			row.addView(del, new LinearLayout.LayoutParams(-2, -1));
@@ -1478,7 +1575,7 @@ public class MainActivity extends Activity {
 					return;
 				final String msg = t[0] + t[1] == 0 ? "Trash is empty."
 						: (t[0] + t[1]) + " item" + (t[0] + t[1] == 1 ? "" : "s") + ", " + human(t[2]);
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						if (!stop[0])
 							dlg.setMessage(msg);
@@ -1506,7 +1603,7 @@ public class MainActivity extends Activity {
 		if (now - t[3] > 300) {
 			t[3] = now;
 			final String m = "Counting... " + (t[0] + t[1]) + " items, " + human(t[2]);
-			runOnUiThread(new Runnable() {
+			uiPost(new Runnable() {
 				public void run() {
 					if (!stop[0])
 						dlg.setMessage(m);
@@ -1671,7 +1768,7 @@ public class MainActivity extends Activity {
 				ArrayList<VolInfo> pv = volCache;
 				for (int pi = 0; pi < pv.size(); pi++)
 					prefetch(pv.get(pi).dir, opened);
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 					
 						if ((left ? leftGen : rightGen) != gen)
@@ -1695,7 +1792,8 @@ public class MainActivity extends Activity {
 				continue;
 			addNode(host, specs, yCursor, vd, left, 0, true, new ArrayList<Boolean>(), true);
 		}
-		addNode(host, specs, yCursor, MegaItem.root(), left, 0, true, new ArrayList<Boolean>(), true);
+		if (showMega)
+			addNode(host, specs, yCursor, MegaItem.root(), left, 0, true, new ArrayList<Boolean>(), true);
 
 		ViewGroup.LayoutParams lp = lines.getLayoutParams();
 		if (lp == null)
@@ -1705,6 +1803,7 @@ public class MainActivity extends Activity {
 		lines.setLayoutParams(lp);
 		lines.setSpecs(specs);
 		scrollBookmarkIntoView(left);
+		restoreScroll(left);
 	}
 
 	void addNode(LinearLayout host, ArrayList<LineSpec> specs, int[] yCursor, final File f, final boolean left,
@@ -2109,6 +2208,20 @@ public class MainActivity extends Activity {
 				}
 			}
 		}
+	}
+
+	/** puts a pane back at the scroll position it had when the app was closed (once, after the first build) */
+	void restoreScroll(final boolean left) {
+		final int y = left ? leftScrollY : rightScrollY;
+		final ScrollView sc = left ? leftTreeScroll : rightTreeScroll;
+		if (left) leftScrollY = -1; else rightScrollY = -1;
+		if (y <= 0 || sc == null || pendingBookmarkScrollPath != null)
+			return;
+		sc.post(new Runnable() {
+			public void run() {
+				sc.scrollTo(0, y);
+			}
+		});
 	}
 
 	void scrollTreesToTop() {
@@ -2679,7 +2792,7 @@ public class MainActivity extends Activity {
 				final long[] t = new long[3]; // files, folders, bytes
 				for (int i = 0; i < items.size(); i++)
 					tally(items.get(i), t);
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						try {
 							wait.dismiss();
@@ -2780,7 +2893,7 @@ public class MainActivity extends Activity {
 					}
 				}
 				final String m = err;
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						try {
 							wait.dismiss();
@@ -2897,6 +3010,24 @@ public class MainActivity extends Activity {
 			}
 			return;
 		}
+		if (a == 25) { // bookmark / un-bookmark all selected folders
+			ArrayList<File> fl = multiBookmarkFolders();
+			boolean allMarked = !fl.isEmpty();
+			for (int i = 0; i < fl.size(); i++)
+				if (!isBookmarked(fl.get(i)))
+					allMarked = false;
+			for (int i = 0; i < fl.size(); i++) {
+				String path = fl.get(i).getAbsolutePath();
+				if (allMarked)
+					bookmarks.remove(path);
+				else if (!bookmarks.contains(path))
+					bookmarks.add(path);
+			}
+			saveState();
+			toast(allMarked ? "Bookmarks removed" : "Bookmarked " + fl.size() + (fl.size() == 1 ? " folder" : " folders"));
+			refresh(true, true, false);
+			return;
+		}
 		if (multiMode) {
 			multiAction(a);
 			return;
@@ -2967,6 +3098,11 @@ public class MainActivity extends Activity {
 		if (cached != null)
 			return cached;
 		File[] a = f.listFiles();
+		String zerr = ZipItem.lastError;
+		if (zerr != null && f instanceof ZipItem) {
+			ZipItem.lastError = null;
+			toast(zerr);
+		}
 		if (a != null && !(f instanceof ZipItem)) {
 			for (int i = 0; i < a.length; i++) {
 				if (a[i].isFile() && ZipItem.isZipName(a[i].getName()))
@@ -2996,6 +3132,15 @@ public class MainActivity extends Activity {
 		return out;
 	}
 
+	/** lower-case file extension without the dot ("" for none) */
+	static String extOf(File f) {
+		if (f.isDirectory())
+			return "";
+		String n = f.getName();
+		int dot = n.lastIndexOf('.');
+		return dot < 0 || dot == n.length() - 1 ? "" : n.substring(dot + 1).toLowerCase(Locale.US);
+	}
+
 	Comparator<File> sortComparator(final boolean left) {
 		final int mode = left ? leftSort : rightSort;
 		final boolean rev = left ? leftSortRev : rightSortRev;
@@ -3008,6 +3153,8 @@ public class MainActivity extends Activity {
 					c = Long.valueOf(a.length()).compareTo(Long.valueOf(b.length()));
 				else if (mode == SORT_DATE)
 					c = Long.valueOf(a.lastModified()).compareTo(Long.valueOf(b.lastModified()));
+				else if (mode == SORT_TYPE)
+					c = extOf(a).compareTo(extOf(b));
 				else
 					c = a.getName().compareToIgnoreCase(b.getName());
 				if (c == 0)
@@ -3021,12 +3168,15 @@ public class MainActivity extends Activity {
 		int curMode = left ? leftSort : rightSort;
 		boolean curRev = left ? leftSortRev : rightSortRev;
 		final String[] labels = {"Name", "Name (Z\u2192A)", "Size (small\u2192large)", "Size (large\u2192small)",
-				"Date modified (old\u2192new)", "Date modified (new\u2192old)"};
+				"Date modified (old\u2192new)", "Date modified (new\u2192old)",
+				"Type (A\u2192Z)", "Type (Z\u2192A)"};
 		int checked;
 		if (curMode == SORT_SIZE)
 			checked = curRev ? 3 : 2;
 		else if (curMode == SORT_DATE)
 			checked = curRev ? 5 : 4;
+		else if (curMode == SORT_TYPE)
+			checked = curRev ? 7 : 6;
 		else
 			checked = curRev ? 1 : 0;
 		createDialog("Sort by", null)
@@ -3053,6 +3203,14 @@ public class MainActivity extends Activity {
 								break;
 							case 5 :
 								mode = SORT_DATE;
+								rev = true;
+								break;
+							case 6 :
+								mode = SORT_TYPE;
+								rev = false;
+								break;
+							case 7 :
+								mode = SORT_TYPE;
 								rev = true;
 								break;
 							default :
@@ -3201,6 +3359,18 @@ public class MainActivity extends Activity {
 		};
 	}
 
+	/** the selected normal folders (archives, cloud items and files cannot be bookmarked); empty unless all selected items are such folders */
+	ArrayList<File> multiBookmarkFolders() {
+		ArrayList<File> out = new ArrayList<File>();
+		for (int i = 0; i < multi.size(); i++) {
+			File m = multi.get(i);
+			if (m instanceof ZipItem || m instanceof MegaItem || !m.isDirectory())
+				return new ArrayList<File>();
+			out.add(m);
+		}
+		return out;
+	}
+
 	void showMultiMenu() {
 		if (multi.isEmpty())
 			return;
@@ -3214,6 +3384,15 @@ public class MainActivity extends Activity {
 		addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
 		addItem(labels, icons, codes, "\uD83D\uDCE6", "Zip", 9);
 		addItem(labels, icons, codes, "\uD83D\uDCE4", "Share", 13);
+		ArrayList<File> bmFolders = multiBookmarkFolders();
+		if (!bmFolders.isEmpty()) {
+			boolean allMarked = true;
+			for (int i = 0; i < bmFolders.size(); i++)
+				if (!isBookmarked(bmFolders.get(i)))
+					allMarked = false;
+			addItem(labels, icons, codes, allMarked ? "\u2606" : "\u2605",
+					allMarked ? "Remove bookmark" : "Bookmark", 25);
+		}
 		createDialog(multi.size() + " selected", null)
 				.setAdapter(menuAdapter(labels, icons), new DialogInterface.OnClickListener() {
 					public void onClick(DialogInterface d, int which) {
@@ -3253,7 +3432,7 @@ public class MainActivity extends Activity {
 						err = "Error: " + e.getMessage();
 					}
 					final String m = err;
-					runOnUiThread(new Runnable() {
+					uiPost(new Runnable() {
 						public void run() {
 							if (m != null)
 								toast(m);
@@ -3343,7 +3522,7 @@ public class MainActivity extends Activity {
 				}
 				final String m = err;
 				final boolean rl = relogin;
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						if (m == null) {
 							listCache.clear();
@@ -3428,7 +3607,7 @@ public class MainActivity extends Activity {
 				}
 				final String m = err;
 				final int ec = errCode;
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						try {
 							wait.dismiss();
@@ -3540,7 +3719,7 @@ public class MainActivity extends Activity {
 					}
 				}
 				final String m = err;
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						if (m != null)
 							toast("MEGA: " + m);
@@ -3635,7 +3814,7 @@ public class MainActivity extends Activity {
 					msg = "MEGA: " + (e.getMessage() == null ? e.toString() : e.getMessage());
 				}
 				final String m = msg;
-				runOnUiThread(new Runnable() {
+				uiPost(new Runnable() {
 					public void run() {
 						try {
 							wait.dismiss();
@@ -3875,7 +4054,7 @@ public class MainActivity extends Activity {
 						err = "Error: " + e.getMessage();
 					}
 					final String m = err;
-					runOnUiThread(new Runnable() {
+					uiPost(new Runnable() {
 						public void run() {
 							if (m != null)
 								toast(m);
@@ -4215,8 +4394,12 @@ public class MainActivity extends Activity {
 		if (leftTree != null)
 			refresh();
 	}
-	void toast(String s) {
-		Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+	void toast(final String s) {
+		uiPost(new Runnable() {
+			public void run() {
+				Toast.makeText(MainActivity.this, s, Toast.LENGTH_SHORT).show();
+			}
+		});
 	}
 }
 
