@@ -91,7 +91,7 @@ class MegaCrypto {
 		return k;
 	}
 
-	/** "MEGA{...json...}" -> json text, or null when the key was wrong */
+	/** "MEGA{...json...}" to json text, or null when the key was wrong */
 	static String decryptAttr(String a, byte[] nodeKey) throws IOException {
 		byte[] raw = b64d(a);
 		int len = raw.length - raw.length % 16;
@@ -241,7 +241,7 @@ class MegaCrypto {
 		}
 	}
 
-	/** json text -> base64 of AES-CBC("MEGA" + json, zero padded), the key is the node's attribute key */
+	/** json text to base64 of AES-CBC("MEGA" + json, zero padded), the key is the node's attribute key */
 	static String encryptAttr(String json, byte[] nodeKey) throws IOException {
 		byte[] j = json.getBytes("UTF-8");
 		byte[] raw = new byte[4 + j.length];
