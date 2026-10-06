@@ -6,6 +6,7 @@ import android.graphics.Paint;
 import android.graphics.RectF;
 import android.os.SystemClock;
 import android.text.Layout;
+import android.text.method.KeyListener;
 import android.util.TypedValue;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -25,6 +26,7 @@ public class PreviewTextView extends EditText {
 	}
 
 	private Listener listener;
+	private KeyListener editKeyListener;
 
 	// ---- block / current line highlighting, same look as the text editor ----
 	private final IndentGuides guides = new IndentGuides();
@@ -43,7 +45,8 @@ public class PreviewTextView extends EditText {
 		super(c);
 		density = getResources().getDisplayMetrics().density;
 		setVerticalScrollBarEnabled(false);
-		setKeyListener(null); // read-only: no keyboard, selection still works
+		editKeyListener = getKeyListener();
+		setKeyListener(null); // read-only by default: no keyboard, selection still works
 		setTextIsSelectable(true);
 		scaleDetector = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
 			public boolean onScaleBegin(ScaleGestureDetector d) {
@@ -68,6 +71,18 @@ public class PreviewTextView extends EditText {
 	public void setViewListener(Listener l) {
 		listener = l;
 	}
+
+	/** Switch between the normal read-only viewer and an editable text field. */
+	public void setEditable(boolean editable) {
+		setKeyListener(editable ? editKeyListener : null);
+		setTextIsSelectable(true);
+		setCursorVisible(editable);
+		setFocusable(editable);
+		setFocusableInTouchMode(editable);
+		if (editable) requestFocus();
+	}
+
+	public boolean isEditable() { return getKeyListener() != null; }
 
 	/** Turns the green block bar (and for HTML/XML the tag pair box) on; tagMode = HTML/XML. */
 	public void configureGuides(boolean tagMode, boolean dark, int defaultIndent) {
