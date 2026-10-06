@@ -206,7 +206,7 @@ class MegaClient {
 		java.util.Iterator<?> it = req.keys();
 		while (it.hasNext())
 			ks.append(' ').append(it.next());
-		log("-> request a=" + req.optString("a", "?") + " fields:" + ks);
+		log("request a=" + req.optString("a", "?") + " fields:" + ks);
 		try {
 			Object o = api0(req);
 			log("<- ok " + (o instanceof JSONObject ? describe(o) : String.valueOf(o)));
