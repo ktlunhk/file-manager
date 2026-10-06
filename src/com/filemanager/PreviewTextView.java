@@ -25,6 +25,13 @@ public class PreviewTextView extends EditText {
 	}
 
 	private Listener listener;
+
+	// ---- block / current line highlighting, same look as the text editor ----
+	private final IndentGuides guides = new IndentGuides();
+	private final Paint lineBgPaint = new Paint();
+	private int textVersion; // grows with every text change, so the guides know when to recompute
+	private boolean darkTheme = true;
+	private int lnVer = -1, lnSel = -1, lnStart, lnEnd; // cached bounds of the line that holds the cursor
 	private boolean hScrollEnabled, inTouch, allowX, hDragging, vDecided, vDragging, swallowGesture;
 	private float downX, downY, lastX, lastY, scrollYf, dragSpeed;
 	private long lastMoveTime;
@@ -60,6 +67,52 @@ public class PreviewTextView extends EditText {
 
 	public void setViewListener(Listener l) {
 		listener = l;
+	}
+
+	/** Turns the green block bar (and for HTML/XML the tag pair box) on; tagMode = HTML/XML. */
+	public void configureGuides(boolean tagMode, boolean dark, int defaultIndent) {
+		darkTheme = dark;
+		lineBgPaint.setColor(dark ? 0xFF2A2A3A : 0xFFFFF8E1);
+		guides.configure(true, tagMode, dark, defaultIndent);
+		invalidate();
+	}
+
+	protected void onTextChanged(CharSequence text, int start, int lengthBefore, int lengthAfter) {
+		super.onTextChanged(text, start, lengthBefore, lengthAfter);
+		textVersion++;
+	}
+
+	/** a tap moves the (invisible) cursor: the current line, the green block and the gutter number follow it */
+	protected void onSelectionChanged(int selStart, int selEnd) {
+		super.onSelectionChanged(selStart, selEnd);
+		invalidate();
+		if (listener != null) listener.onViewScrolled();
+	}
+
+	/** shaded background of the line that holds the cursor (all its rows when wrapped) */
+	private void drawCurrentLine(Canvas canvas) {
+		Layout l = getLayout();
+		if (l == null) return;
+		CharSequence t = getText();
+		int len = t.length();
+		int sel = getSelectionStart();
+		if (len == 0 || sel < 0) return;
+		if (sel > len) sel = len;
+		if (lnVer != textVersion || lnSel != sel) {
+			lnVer = textVersion;
+			lnSel = sel;
+			int s = sel;
+			while (s > 0 && t.charAt(s - 1) != '\n') s--;
+			int e = sel;
+			while (e < len && t.charAt(e) != '\n') e++;
+			lnStart = s;
+			lnEnd = e;
+		}
+		int r1 = l.getLineForOffset(Math.min(lnStart, len));
+		int r2 = l.getLineForOffset(Math.min(lnEnd, len));
+		float top = getExtendedPaddingTop() + l.getLineTop(r1);
+		float bottom = getExtendedPaddingTop() + l.getLineBottom(r2);
+		canvas.drawRect(getScrollX(), top, getScrollX() + getWidth(), bottom, lineBgPaint);
 	}
 
 	protected void onScrollChanged(int h, int v, int oh, int ov) {
@@ -232,8 +285,11 @@ public class PreviewTextView extends EditText {
 	}
 
 	protected void onDraw(Canvas canvas) {
+		drawCurrentLine(canvas); // behind the text
 		super.onDraw(canvas);
 		anchoring = false;
+		// after the text: the guides only sit in the blank indent area, and this way the line shade cannot hide them
+		guides.draw(canvas, this, textVersion, density);
 		int max = maxScrollY();
 		if (max <= 0) return;
 		float vis = thumbVisibility();
