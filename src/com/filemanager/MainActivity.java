@@ -880,6 +880,20 @@ public class MainActivity extends Activity {
 		});
 	}
 
+	/** takes the highlight off the row that is selected now (without rebuilding the tree) */
+	void unhighlightSelected(View keepRow) {
+		LinearLayout oldTree = selectedLeft ? leftTree : rightTree;
+		if (selected == null || oldTree == null)
+			return;
+		View oldRow = oldTree.findViewWithTag(selected.getAbsolutePath());
+		if (oldRow != null && oldRow != keepRow) {
+			if (searching && searchMatches.contains(selected.getAbsolutePath()))
+				oldRow.setBackgroundColor(colSearchRow);
+			else
+				oldRow.setBackgroundColor(colSurface);
+		}
+	}
+
 	void markSelected(File f, boolean left) {
 		selected = f;
 		selectedLeft = left;
@@ -2092,6 +2106,10 @@ public class MainActivity extends Activity {
 
 		View.OnClickListener click = new View.OnClickListener() {
 			public void onClick(View v) {
+				if (!rootNode) {
+					unhighlightSelected(row);
+					row.setBackgroundColor(colSelectedRow);
+				}
 				markSelected(f, left);
 				if (f.isDirectory() || isMegaArchive(f))
 					toggleFolder(f, left);
@@ -2108,11 +2126,13 @@ public class MainActivity extends Activity {
 		name.setOnClickListener(click);
 		sub.setOnClickListener(click);
 		textBox.setOnClickListener(click);
+		icon.setOnClickListener(click);
 
 		View.OnLongClickListener lc = new View.OnLongClickListener() {
 			public boolean onLongClick(View v) {
 				v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
 				if (!rootNode) {
+					unhighlightSelected(row);
 					markSelected(f, left);
 					row.setBackgroundColor(colSelectedRow);
 				}
@@ -2136,48 +2156,6 @@ public class MainActivity extends Activity {
 				return true;
 			}
 		};
-		View.OnTouchListener pressTouch = new View.OnTouchListener() {
-			public boolean onTouch(View v, MotionEvent event) {
-				if (rootNode) return false;
-				switch (event.getActionMasked()) {
-					case MotionEvent.ACTION_DOWN:
-						// Clear the old visual highlight without rebuilding the tree.
-						// Rebuilding here would replace the touched row before ACTION_UP
-						// and prevent the folder click from expanding/collapsing.
-						LinearLayout oldTree = selectedLeft ? leftTree : rightTree;
-						if (selected != null && oldTree != null) {
-							View oldRow = oldTree.findViewWithTag(selected.getAbsolutePath());
-							if (oldRow != null && oldRow != row) {
-								if (searching && searchMatches.contains(selected.getAbsolutePath()))
-									oldRow.setBackgroundColor(colSearchRow);
-								else
-									oldRow.setBackgroundColor(colSurface);
-							}
-						}
-						selected = f;
-						selectedLeft = left;
-						row.setBackgroundColor(colSelectedRow);
-						break;
-					case MotionEvent.ACTION_UP:
-					case MotionEvent.ACTION_CANCEL:
-						boolean keep = selected != null && left == selectedLeft && selected.equals(f);
-						if (!keep) {
-							if (searching && searchMatches.contains(f.getAbsolutePath()))
-								row.setBackgroundColor(colSearchRow);
-							else
-								row.setBackgroundColor(colSurface);
-						}
-						break;
-				}
-				return false;
-			}
-		};
-		row.setOnTouchListener(pressTouch);
-		exp.setOnTouchListener(pressTouch);
-		icon.setOnTouchListener(pressTouch);
-		name.setOnTouchListener(pressTouch);
-		sub.setOnTouchListener(pressTouch);
-		textBox.setOnTouchListener(pressTouch);
 		row.setOnLongClickListener(lc);
 		exp.setOnLongClickListener(lc);
 		icon.setOnLongClickListener(lc);
@@ -2208,12 +2186,10 @@ public class MainActivity extends Activity {
 				diskTxt.setTextSize(11);
 				diskTxt.setSingleLine(true);
 				diskTxt.setOnClickListener(click);
-				diskTxt.setOnTouchListener(pressTouch);
 				diskTxt.setOnLongClickListener(lc);
 				textBox.addView(diskTxt, new LinearLayout.LayoutParams(-1, 0, 1));
 				DiskBar db = new DiskBar(this, (tot - free) / (float) tot);
 				db.setOnClickListener(click);
-				db.setOnTouchListener(pressTouch);
 				db.setOnLongClickListener(lc);
 				LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, 6 * dp);
 				bp.bottomMargin = 8 * dp;
@@ -3419,7 +3395,7 @@ public class MainActivity extends Activity {
 	void showSortMenu(final boolean left) {
 		int curMode = left ? leftSort : rightSort;
 		boolean curRev = left ? leftSortRev : rightSortRev;
-		final String[] labels = {"Name(A\u2192Z)", "Name (Z\u2192A)", "Size (small\u2192large)", "Size (large\u2192small)",
+		final String[] labels = {"Name (A\u2192Z)", "Name (Z\u2192A)", "Size (small\u2192large)", "Size (large\u2192small)",
 				"Date modified (old\u2192new)", "Date modified (new\u2192old)",
 				"Type (A\u2192Z)", "Type (Z\u2192A)"};
 		int checked;
