@@ -647,9 +647,12 @@ class PreviewManager {
 			lineNums.setTypeface(android.graphics.Typeface.MONOSPACE);
 			lineNums.setTextSize(12);
 			lineNums.setNumberColor(activity.colTextMuted);
+			lineNums.setCurrentColor(activity.dark ? Color.rgb(187, 134, 252) : Color.rgb(123, 31, 162));
 			lineNums.setBackgroundColor(activity.colSurfaceAlt);
 			lineNums.setPadding(10 * activity.dp, 10 * activity.dp, 8 * activity.dp, 10 * activity.dp);
 			lineNums.attach(tv);
+			// green block bar next to the code around the cursor, shaded cursor line (like the text editor)
+			tv.configureGuides("html".equals(EditorHighlighter.detectLanguage(file.getName())), activity.dark, 4);
 
 			View divider = new View(activity);
 			divider.setBackgroundColor(activity.colDivider);
@@ -785,7 +788,9 @@ class PreviewManager {
 				public void run() {
 					SpannableStringBuilder styled = null;
 					try {
-						styled = new SyntaxHighlighter(activity.dark).highlight(content, ext);
+						// the same colours the text editor uses; file types only the old tokenizer knows keep using it
+						styled = EditorHighlighter.styled(content, file.getName(), activity.dark);
+						if (styled == null) styled = new SyntaxHighlighter(activity.dark).highlight(content, ext);
 					} catch (Throwable t) {
 						styled = null; // highlighting is cosmetic - never let it break the preview
 					}
@@ -794,7 +799,15 @@ class PreviewManager {
 					activity.uiPost(new Runnable() {
 						public void run() {
 							if (gen != previewGen) return;
+							int keepA = tv.getSelectionStart(), keepB = tv.getSelectionEnd();
 							tv.setText(fs, TextView.BufferType.SPANNABLE);
+							// setText moves the cursor to the top: put it back where the user tapped
+							if (keepA > 0 && keepB >= 0 && keepA <= fs.length() && keepB <= fs.length()) {
+								try {
+									android.text.Selection.setSelection((Spannable) tv.getText(), keepA, keepB);
+								} catch (RuntimeException e) {
+								}
+							}
 							hitSpans.clear(); // setText dropped the old search spans
 							curSpan = null;
 							if (searchBar.getVisibility() == View.VISIBLE) updateHits(false);
