@@ -228,6 +228,15 @@ class ZipItem extends File {
     }
 
     static void extract(ZipItem zi, File dst) throws IOException {
+        // Archive paths are untrusted. Ensure each destination stays under its requested parent.
+        File parent = dst.getParentFile();
+        if (parent != null) {
+            String pp = parent.getCanonicalPath();
+            String dp = dst.getCanonicalPath();
+            if (!(dp.equals(pp) || dp.startsWith(pp + File.separator))) throw new IOException("Unsafe archive path");
+        }
+        if (zi.getName().equals("..") || zi.getName().indexOf('/') >= 0 || zi.getName().indexOf('\\') >= 0)
+            throw new IOException("Unsafe archive entry name");
         if (zi.isDirectory()) {
             if (!dst.exists() && !dst.mkdirs()) throw new IOException("Cannot create " + dst.getName());
             File[] c = zi.listFiles();
