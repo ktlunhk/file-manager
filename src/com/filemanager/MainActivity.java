@@ -4,6 +4,13 @@ import android.app.*;
 import android.os.*;
 import android.content.*;
 import android.content.pm.PackageManager;
+import android.content.pm.PackageInfo;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.Signature;
+import android.graphics.BitmapFactory;
+import android.webkit.MimeTypeMap;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipEntry;
 import android.graphics.Color;
 import android.net.Uri;
 import android.provider.Settings;
@@ -13,6 +20,7 @@ import android.widget.*;
 import java.io.*;
 import java.text.*;
 import java.util.*;
+import java.security.MessageDigest;
 
 public class MainActivity extends Activity {
 	FileOperations fileOperations;
@@ -61,7 +69,11 @@ public class MainActivity extends Activity {
 	boolean searching;
 	Thread searchThread; 
 	volatile boolean searchCancelled;
-	int searchGen; 
+	int searchGen;
+	boolean advSearchRecursive = true, advSearchCase = false;
+	int advSearchKind = 0; // 0 all, 1 files, 2 folders
+	String advSearchExt = "";
+	long advSearchMin = -1, advSearchMax = -1, advSearchAfter = -1; 
 	int dp;
 	ArrayList<String> bookmarks = new ArrayList<String>();
 	static final String TRASH_NAME = ".trash";
@@ -413,23 +425,37 @@ public class MainActivity extends Activity {
 			refresh();
 	}
 
+	boolean sameOrUnderPath(File child, File parent) {
+		if (child == null || parent == null) return false;
+		try {
+			String c = child.getCanonicalPath();
+			String p = parent.getCanonicalPath();
+			return c.equals(p) || c.startsWith(p + File.separator);
+		} catch (IOException e) {
+			String c = child.getAbsolutePath();
+			String p = parent.getAbsolutePath();
+			return c.equals(p) || c.startsWith(p + File.separator);
+		}
+	}
+
 	void dropPath(String path) {
 		File internal = Environment.getExternalStorageDirectory();
-		if (leftRoot.getAbsolutePath().startsWith(path)) {
+		File removed = new File(path);
+		if (sameOrUnderPath(leftRoot, removed)) {
 			leftRoot = internal;
 			leftOpen.clear();
 			leftOpen.add(internal.getAbsolutePath());
 		}
-		if (rightRoot.getAbsolutePath().startsWith(path)) {
+		if (sameOrUnderPath(rightRoot, removed)) {
 			rightRoot = internal;
 			rightOpen.clear();
 			rightOpen.add(internal.getAbsolutePath());
 		}
-		if (leftCur.getAbsolutePath().startsWith(path))
+		if (sameOrUnderPath(leftCur, removed))
 			leftCur = leftRoot;
-		if (rightCur.getAbsolutePath().startsWith(path))
+		if (sameOrUnderPath(rightCur, removed))
 			rightCur = rightRoot;
-		if (selected != null && selected.getAbsolutePath().startsWith(path))
+		if (selected != null && sameOrUnderPath(selected, removed))
 			selected = null;
 		if (multiMode)
 			exitMulti();
@@ -1046,6 +1072,21 @@ public class MainActivity extends Activity {
 		});
 		b.addView(trashBtn, new LinearLayout.LayoutParams(-2, -1));
 
+		TextView compareBtn = new TextView(this);
+		compareBtn.setText("\u21D4");
+		compareBtn.setTextSize(18);
+		compareBtn.setGravity(Gravity.CENTER);
+		compareBtn.setTextColor(colText);
+		compareBtn.setPadding(10 * dp, 0, 10 * dp, 0);
+		compareBtn.setContentDescription("Compare left and right folders");
+		applyRipple(compareBtn);
+		compareBtn.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				showFolderCompare();
+			}
+		});
+		b.addView(compareBtn, new LinearLayout.LayoutParams(-2, -1));
+
 		TextView settingsBtn = new TextView(this);
 		settingsBtn.setText("\u2699");
 		settingsBtn.setTextSize(16);
@@ -1061,6 +1102,149 @@ public class MainActivity extends Activity {
 		});
 		b.addView(settingsBtn, new LinearLayout.LayoutParams(-2, -1));
 		return b;
+	}
+
+
+	static final int CMP_SAME = 0, CMP_LEFT_ONLY = 1, CMP_RIGHT_ONLY = 2, CMP_LEFT_NEWER = 3,
+			CMP_RIGHT_NEWER = 4, CMP_DIFFERENT = 5, CMP_TYPE_CONFLICT = 6;
+
+	static class CompareItem {
+		String name;
+		File left, right;
+		int status;
+		CompareItem(String name, File left, File right, int status) {
+			this.name = name; this.left = left; this.right = right; this.status = status;
+		}
+	}
+
+	String compareStatus(int s) {
+		if (s == CMP_LEFT_ONLY) return "LEFT ONLY";
+		if (s == CMP_RIGHT_ONLY) return "RIGHT ONLY";
+		if (s == CMP_LEFT_NEWER) return "LEFT NEWER";
+		if (s == CMP_RIGHT_NEWER) return "RIGHT NEWER";
+		if (s == CMP_DIFFERENT) return "DIFFERENT";
+		if (s == CMP_TYPE_CONFLICT) return "TYPE CONFLICT";
+		return "SAME";
+	}
+
+	void showFolderCompare() {
+		final File l = leftCur, r = rightCur;
+		if (l == null || r == null || !l.isDirectory() || !r.isDirectory()) {
+			toast("Both panes must be local folders"); return;
+		}
+		if (l instanceof ZipItem || r instanceof ZipItem || l instanceof MegaItem || r instanceof MegaItem) {
+			toast("Compare currently supports local folders only"); return;
+		}
+		final boolean[] cancel = new boolean[] { false };
+		final OperationProgress prog = new OperationProgress(this, "Comparing folders", true, false, dp, new Runnable() {
+			public void run() { cancel[0] = true; }
+		});
+		prog.update("Reading folders...", 0, 0, "");
+		new Thread(new Runnable() {
+			public void run() {
+				final ArrayList<CompareItem> result = new ArrayList<CompareItem>();
+				String err = null;
+				try {
+					TreeMap<String, File> lm = compareMap(l), rm = compareMap(r);
+					TreeSet<String> names = new TreeSet<String>(String.CASE_INSENSITIVE_ORDER);
+					names.addAll(lm.keySet()); names.addAll(rm.keySet());
+					int done = 0, total = names.size();
+					for (String name : names) {
+						if (cancel[0]) break;
+						File a = lm.get(name), b = rm.get(name);
+						int st = comparePair(a, b);
+						result.add(new CompareItem(name, a, b, st));
+						done++;
+						if ((done & 15) == 0 || done == total) {
+							final int fd = done, ft = total;
+							uiPost(new Runnable() { public void run() { prog.update("Comparing...", fd, ft, fd + " / " + ft); } });
+						}
+					}
+				} catch (Exception e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
+				final String ferr = err;
+				uiPost(new Runnable() { public void run() {
+					try { prog.dialog.dismiss(); } catch (Exception e) {}
+					if (cancel[0]) { toast("Compare cancelled"); return; }
+					if (ferr != null) { showMessageDialog("Compare folders", ferr); return; }
+					showCompareResults(l, r, result);
+				} });
+			}
+		}).start();
+	}
+
+	TreeMap<String, File> compareMap(File dir) {
+		TreeMap<String, File> m = new TreeMap<String, File>(String.CASE_INSENSITIVE_ORDER);
+		File[] a = dir.listFiles();
+		if (a != null) for (int i = 0; i < a.length; i++) {
+			if (!showHidden && a[i].getName().startsWith(".")) continue;
+			m.put(a[i].getName(), a[i]);
+		}
+		return m;
+	}
+
+	int comparePair(File a, File b) {
+		if (a == null) return CMP_RIGHT_ONLY;
+		if (b == null) return CMP_LEFT_ONLY;
+		if (a.isDirectory() != b.isDirectory()) return CMP_TYPE_CONFLICT;
+		if (a.isDirectory()) {
+			long am = a.lastModified(), bm = b.lastModified();
+			if (Math.abs(am - bm) <= 2000) return CMP_SAME;
+			return am > bm ? CMP_LEFT_NEWER : CMP_RIGHT_NEWER;
+		}
+		if (a.length() != b.length()) return CMP_DIFFERENT;
+		long am = a.lastModified(), bm = b.lastModified();
+		if (Math.abs(am - bm) <= 2000) return CMP_SAME;
+		return am > bm ? CMP_LEFT_NEWER : CMP_RIGHT_NEWER;
+	}
+
+	void showCompareResults(final File l, final File r, final ArrayList<CompareItem> all) {
+		int[] c = new int[7];
+		for (int i = 0; i < all.size(); i++) c[all.get(i).status]++;
+		LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(16*dp, 8*dp, 16*dp, 8*dp);
+		TextView summary = new TextView(this); summary.setTextColor(colText); summary.setTextSize(13);
+		summary.setText("Left: " + l.getAbsolutePath() + "\nRight: " + r.getAbsolutePath() + "\n\n" +
+				"Same " + c[CMP_SAME] + "   Left only " + c[CMP_LEFT_ONLY] + "   Right only " + c[CMP_RIGHT_ONLY] + "\n" +
+				"Left newer " + c[CMP_LEFT_NEWER] + "   Right newer " + c[CMP_RIGHT_NEWER] + "   Different " + c[CMP_DIFFERENT] +
+				"   Conflicts " + c[CMP_TYPE_CONFLICT]);
+		root.addView(summary, new LinearLayout.LayoutParams(-1, -2));
+		final CheckBox same = new CheckBox(this); same.setText("Show SAME items"); same.setTextColor(colText); root.addView(same);
+		final LinearLayout rows = new LinearLayout(this); rows.setOrientation(LinearLayout.VERTICAL);
+		ScrollView sv = new ScrollView(this); sv.addView(rows); root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1));
+		final AlertDialog dlg = createDialog("Compare folders", null).setView(root).setPositiveButton("Close", null).create();
+		final Runnable rebuild = new Runnable() { public void run() { buildCompareRows(rows, all, same.isChecked(), dlg); } };
+		same.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() { public void onCheckedChanged(CompoundButton b, boolean v) { rebuild.run(); } });
+		rebuild.run(); dlg.show();
+	}
+
+	void buildCompareRows(LinearLayout rows, final ArrayList<CompareItem> all, boolean showSame, final AlertDialog dlg) {
+		rows.removeAllViews();
+		for (int i = 0; i < all.size(); i++) {
+			final CompareItem ci = all.get(i);
+			if (!showSame && ci.status == CMP_SAME) continue;
+			LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(4*dp, 7*dp, 4*dp, 7*dp);
+			TextView t = new TextView(this); t.setTextColor(colText); t.setTextSize(13); t.setText(ci.name + "\n" + compareStatus(ci.status)); row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
+			if (ci.left != null && ci.status != CMP_SAME) {
+				Button b = new Button(this); b.setText("\u2192"); b.setContentDescription("Copy left to right"); b.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { compareCopy(ci, true, dlg); } }); row.addView(b, new LinearLayout.LayoutParams(54*dp, -2));
+			}
+			if (ci.right != null && ci.status != CMP_SAME) {
+				Button b = new Button(this); b.setText("\u2190"); b.setContentDescription("Copy right to left"); b.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { compareCopy(ci, false, dlg); } }); row.addView(b, new LinearLayout.LayoutParams(54*dp, -2));
+			}
+			rows.addView(row, new LinearLayout.LayoutParams(-1, -2));
+		}
+	}
+
+	void compareCopy(final CompareItem ci, final boolean leftToRight, final AlertDialog dlg) {
+		final File src = leftToRight ? ci.left : ci.right;
+		final File base = leftToRight ? rightCur : leftCur;
+		if (src == null || base == null) return;
+		final File dst = new File(base, src.getName());
+		String direction = leftToRight ? "Left to Right" : "Right to Left";
+		String extra = dst.exists() ? "\n\nAn item with this name already exists. The normal conflict dialog will let you Overwrite, Skip, Cancel, or Keep both." : "";
+		createDialog("Copy " + direction, "Copy:\n" + src.getName() + "\n\nTo:\n" + base.getAbsolutePath() + extra)
+			.setPositiveButton("Copy", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+				try { dlg.dismiss(); } catch (Exception e) {}
+				fileOperations.startTransfer(src, dst, false, "Compare copy", "Copied");
+			} }).setNegativeButton("Cancel", null).show();
 	}
 
 	void showSettings() {
@@ -1345,6 +1529,10 @@ public class MainActivity extends Activity {
 			}
 		});
 		row.addView(go, new LinearLayout.LayoutParams(-2, -2));
+		TextView adv = new TextView(this);
+		adv.setText("Filter"); adv.setTextSize(12); adv.setTextColor(colText); adv.setPadding(8*dp,0,8*dp,0); applyRipple(adv);
+		adv.setOnClickListener(new View.OnClickListener(){ public void onClick(View v){ showAdvancedSearchOptions(); }});
+		row.addView(adv, new LinearLayout.LayoutParams(-2,-2));
 		TextView clear = new TextView(this);
 		clear.setText("\u2715");
 		clear.setTextSize(15);
@@ -1398,7 +1586,7 @@ public class MainActivity extends Activity {
 		String name = scope == null
 				? ""
 				: (scope.equals(left ? leftRoot : rightRoot) ? displayRoot(scope) : scope.getName());
-		searchScopeLabel.setText("Search in " + (left ? "left" : "right") + " pane: " + name);
+		searchScopeLabel.setText("Search in " + (left ? "left" : "right") + " pane: " + name + (advSearchExt.length()>0 ? "  *."+advSearchExt : ""));
 	}
 
 	void runSearch() {
@@ -1418,7 +1606,7 @@ public class MainActivity extends Activity {
 		if (searchThread != null) {
 			searchCancelled = true;
 		}
-		final String qLower = q.toLowerCase(Locale.US);
+		final String qLower = advSearchCase ? q : q.toLowerCase(Locale.US);
 		final int gen = ++searchGen;
 		searchCancelled = false;
 		searching = true;
@@ -1463,29 +1651,47 @@ public class MainActivity extends Activity {
 
 	boolean findMatches(File f, String qLower, HashSet<String> opened, HashSet<String> matches, int gen,
 			int[] scanned) {
-		if (searchCancelled || gen != searchGen || matches.size() >= 2000)
-			return false;
+		if (searchCancelled || gen != searchGen || matches.size() >= 2000) return false;
 		scanned[0]++;
-		boolean hit = f.getName().toLowerCase(Locale.US).contains(qLower);
+		String name = advSearchCase ? f.getName() : f.getName().toLowerCase(Locale.US);
+		boolean hit = name.contains(qLower);
+		if (hit && advSearchKind == 1 && f.isDirectory()) hit = false;
+		if (hit && advSearchKind == 2 && !f.isDirectory()) hit = false;
+		if (hit && advSearchExt.length() > 0 && !f.isDirectory()) hit = extOf(f).equals(advSearchExt);
+		if (hit && advSearchExt.length() > 0 && f.isDirectory()) hit = false;
+		if (hit && !f.isDirectory() && advSearchMin >= 0 && f.length() < advSearchMin) hit = false;
+		if (hit && !f.isDirectory() && advSearchMax >= 0 && f.length() > advSearchMax) hit = false;
+		if (hit && advSearchAfter > 0 && f.lastModified() > 0 && f.lastModified() < advSearchAfter) hit = false;
 		boolean childHit = false;
-		if (f.isDirectory() && !(!(f instanceof ZipItem) && isSymlink(f))) {
-			File[] c = children(f); 
-			if (c != null) {
-				for (int i = 0; i < c.length; i++) {
-					if (searchCancelled || gen != searchGen || matches.size() >= 2000)
-						break;
-					if (findMatches(c[i], qLower, opened, matches, gen, scanned))
-						childHit = true;
-				}
+		if (advSearchRecursive && f.isDirectory() && !(!(f instanceof ZipItem) && isSymlink(f))) {
+			File[] c = children(f);
+			if (c != null) for (int i=0;i<c.length;i++) {
+				if (searchCancelled || gen != searchGen || matches.size() >= 2000) break;
+				if (findMatches(c[i], qLower, opened, matches, gen, scanned)) childHit = true;
 			}
 		}
-		if (hit)
-			matches.add(f.getAbsolutePath());
-		if ((hit || childHit) && f.getParentFile() != null)
-			opened.add(f.getParentFile().getAbsolutePath());
-		if (childHit)
-			opened.add(f.getAbsolutePath());
+		if (hit) matches.add(f.getAbsolutePath());
+		if ((hit || childHit) && f.getParentFile() != null) opened.add(f.getParentFile().getAbsolutePath());
+		if (childHit) opened.add(f.getAbsolutePath());
 		return hit || childHit;
+	}
+
+	void showAdvancedSearchOptions() {
+		final LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(16*dp,8*dp,16*dp,4*dp); themeDialogView(box);
+		final Spinner kind=new Spinner(this); kind.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"Files and folders","Files only","Folders only"})); kind.setSelection(advSearchKind); box.addView(kind);
+		final EditText ext=new EditText(this); ext.setHint("Extension, e.g. pdf (optional)"); ext.setSingleLine(true); ext.setText(advSearchExt); box.addView(ext);
+		final EditText min=new EditText(this); min.setHint("Minimum size MB (optional)"); min.setInputType(2|8192); box.addView(min);
+		final EditText max=new EditText(this); max.setHint("Maximum size MB (optional)"); max.setInputType(2|8192); box.addView(max);
+		final EditText days=new EditText(this); days.setHint("Modified within days (optional)"); days.setInputType(2); box.addView(days);
+		final CheckBox rec=new CheckBox(this); rec.setText("Search subfolders / archive entries"); rec.setChecked(advSearchRecursive); box.addView(rec);
+		final CheckBox cs=new CheckBox(this); cs.setText("Case sensitive"); cs.setChecked(advSearchCase); box.addView(cs);
+		createDialog("Advanced search filters", null).setView(box).setPositiveButton("Apply", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){
+			advSearchKind=kind.getSelectedItemPosition(); advSearchExt=ext.getText().toString().trim().toLowerCase(Locale.US); if(advSearchExt.startsWith("."))advSearchExt=advSearchExt.substring(1);
+			try{advSearchMin=min.getText().length()==0?-1:(long)(Double.parseDouble(min.getText().toString())*1024*1024);}catch(Exception e){advSearchMin=-1;}
+			try{advSearchMax=max.getText().length()==0?-1:(long)(Double.parseDouble(max.getText().toString())*1024*1024);}catch(Exception e){advSearchMax=-1;}
+			try{long n=Long.parseLong(days.getText().toString()); advSearchAfter=System.currentTimeMillis()-n*86400000L;}catch(Exception e){advSearchAfter=-1;}
+			advSearchRecursive=rec.isChecked(); advSearchCase=cs.isChecked(); updateSearchScopeLabel();
+		}}).setNeutralButton("Reset", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){advSearchKind=0;advSearchExt="";advSearchMin=-1;advSearchMax=-1;advSearchAfter=-1;advSearchRecursive=true;advSearchCase=false;}}).setNegativeButton("Cancel",null).show();
 	}
 
 	boolean isBookmarked(File f) {
@@ -1610,7 +1816,7 @@ public class MainActivity extends Activity {
 		}
 		boolean left = selected != null ? selectedLeft : true;
 		File root = left ? leftRoot : rightRoot;
-		if (!target.getAbsolutePath().startsWith(root.getAbsolutePath())) {		
+		if (!sameOrUnderPath(target, root)) {		
 			if (left) {
 				leftRoot = target;
 				leftOpen.clear();
@@ -2659,10 +2865,7 @@ public class MainActivity extends Activity {
 	}
 
 	boolean underPath(File x, File dir) {
-		String p = dir.getAbsolutePath();
-		if (!p.endsWith("/"))
-			p += "/";
-		return x.getAbsolutePath().startsWith(p);
+		return x != null && dir != null && !x.equals(dir) && sameOrUnderPath(x, dir);
 	}
 
 	boolean hasMultiBelow(File dir) {
@@ -2827,6 +3030,8 @@ public class MainActivity extends Activity {
 			ZipItem.zipMulti(this);
 		else if (a == 13)
 			shareMulti();
+		else if (a == 28)
+			batchRename();
 		else
 			toast("Not available for several items");
 	}
@@ -3260,6 +3465,7 @@ public class MainActivity extends Activity {
 			return;
 		}
 		if (selected == null) {
+			if (a == 7) { showAbout(); return; }
 			toast("Select a file or folder first");
 			return;
 		}
@@ -3288,6 +3494,10 @@ public class MainActivity extends Activity {
 			shareItem(selected);
 			return;
 		}
+		if (a == 26) { showChecksums(selected); return; }
+		if (a == 27) { showStorageAnalyzer(selected); return; }
+		if (a == 29) { showDuplicateFinder(selected); return; }
+		if (a == 30) { testArchive(selected); return; }
 		if (selected instanceof ZipItem) {
 			ZipItem zi = (ZipItem) selected;
 			if (zi.isRoot()) {			
@@ -3315,6 +3525,19 @@ public class MainActivity extends Activity {
 			duplicate();
 		if (a == 9)
 			ZipItem.zip(this);
+	}
+
+	void showAbout() {
+		String version = "1.0 RC1";
+		try {
+			PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+			if (pi.versionName != null && pi.versionName.length() > 0) version = pi.versionName;
+		} catch (Exception e) { }
+		new AlertDialog.Builder(this)
+			.setTitle("myFiles")
+			.setMessage("Version " + version + "\n\nAIDE Java build\nNo AndroidX")
+			.setPositiveButton("OK", null)
+			.show();
 	}
 
 	File[] children(File f) {
@@ -3528,6 +3751,12 @@ public class MainActivity extends Activity {
 			}
 			addItem(labels, icons, codes, "\u274C", "Delete", 5);
 			addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
+			if (!f.isDirectory() || ZipItem.isZipRoot(f)) addItem(labels, icons, codes, "#", "Checksums", 26);
+			if (ZipItem.isZipRoot(f)) addItem(labels, icons, codes, "T", "Test archive integrity", 30);
+			if (plainFolder) {
+				addItem(labels, icons, codes, "\uD83D\uDCCA", "Storage analyzer", 27);
+				addItem(labels, icons, codes, "=", "Find duplicate files", 29);
+			}
 			addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
 			addItem(labels, icons, codes, "\uD83D\uDCE6", "Zip", 9);
 			if (plainFolder)
@@ -3607,6 +3836,7 @@ public class MainActivity extends Activity {
 		final ArrayList<Integer> codes = new ArrayList<Integer>();
 		addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
 		addItem(labels, icons, codes, "\u2722", "Move", 2);
+		addItem(labels, icons, codes, "\u270F\uFE0F", "Batch rename", 28);
 		addItem(labels, icons, codes, "\u274C", "Delete", 5);
 		addItem(labels, icons, codes, "\u2139\uFE0F", "Info", 7);
 		addItem(labels, icons, codes, "\uD83D\uDCD1", "Duplicate", 8);
@@ -4621,35 +4851,231 @@ public class MainActivity extends Activity {
 				}).setNegativeButton("Cancel", null).show();
 	}
 
+	void showChecksums(final File f) {
+		if (f == null || f instanceof MegaItem) { toast("Checksums are available for local files"); return; }
+		final File checksumFile;
+		if (f instanceof ZipItem) {
+			ZipItem zi = (ZipItem) f;
+			if (!zi.isRoot()) { toast("Select the ZIP/APK file itself to calculate its checksum"); return; }
+			checksumFile = zi.zip;
+		} else {
+			checksumFile = f;
+		}
+		if (checksumFile == null || !checksumFile.isFile()) { toast("Checksums are available for local files"); return; }
+		final AlertDialog wait = busyDialog("Checksums", "Calculating SHA-256 and MD5...");
+		new Thread(new Runnable() { public void run() {
+			String out;
+			try { out = "SHA-256:\n" + digestFile(checksumFile, "SHA-256") + "\n\nMD5:\n" + digestFile(checksumFile, "MD5"); }
+			catch (Exception e) { out = "Error: " + (e.getMessage()==null?e.toString():e.getMessage()); }
+			final String msg=out; uiPost(new Runnable(){ public void run(){
+				try{wait.dismiss();}catch(Exception e){}
+				createDialog(checksumFile.getName(), msg).setPositiveButton("Copy", new DialogInterface.OnClickListener(){ public void onClick(DialogInterface d,int w){
+					ClipboardManager cm=(ClipboardManager)getSystemService(CLIPBOARD_SERVICE); cm.setPrimaryClip(ClipData.newPlainText("Checksums",msg)); toast("Checksums copied");
+				}}).setNegativeButton("Close",null).show();
+			}});
+		}}).start();
+	}
+
+	String digestFile(File f, String alg) throws Exception {
+		MessageDigest md=MessageDigest.getInstance(alg); InputStream in=new FileInputStream(f);
+		try { byte[] b=new byte[65536]; int n; while((n=in.read(b))>0) md.update(b,0,n); } finally { in.close(); }
+		byte[] d=md.digest(); StringBuilder x=new StringBuilder(); for(int i=0;i<d.length;i++){ String h=Integer.toHexString(d[i]&255); if(h.length()<2)x.append('0'); x.append(h); } return x.toString();
+	}
+
+	String fileCategory(File f) {
+		String n=f.getName().toLowerCase(Locale.US); int dot=n.lastIndexOf('.'); String e=dot<0?"":n.substring(dot+1);
+		if (e.equals("jpg")||e.equals("jpeg")||e.equals("png")||e.equals("gif")||e.equals("webp")||e.equals("bmp")) return "Images";
+		if (e.equals("mp4")||e.equals("mkv")||e.equals("avi")||e.equals("mov")||e.equals("webm")||e.equals("3gp")) return "Video";
+		if (e.equals("mp3")||e.equals("wav")||e.equals("m4a")||e.equals("aac")||e.equals("flac")||e.equals("ogg")) return "Audio";
+		if (e.equals("pdf")||e.equals("txt")||e.equals("doc")||e.equals("docx")||e.equals("xls")||e.equals("xlsx")||e.equals("ppt")||e.equals("pptx")||e.equals("csv")) return "Documents";
+		if (e.equals("apk")) return "APK";
+		if (e.equals("zip")||e.equals("rar")||e.equals("7z")||e.equals("tar")||e.equals("gz")||e.equals("tgz")) return "Archives";
+		return "Other";
+	}
+
+	void showStorageAnalyzer(final File root) {
+		if (root == null || !root.isDirectory() || root instanceof MegaItem || root instanceof ZipItem) { toast("Select a local folder"); return; }
+		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*20,dp*14,dp*20,dp*14); progress.setText("Scanning..."); themeDialogView(progress);
+		final AlertDialog scan=createDialog("Storage analyzer", null).setView(progress).setNegativeButton("Cancel", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){cancel[0]=true;}}).create(); scan.show();
+		new Thread(new Runnable(){ public void run(){
+			final long[] t=new long[4]; final long[] cat=new long[7]; final String[] cn={"Images","Video","Audio","Documents","APK","Archives","Other"};
+			final ArrayList<File> biggest=new ArrayList<File>(); ArrayList<File> stack=new ArrayList<File>(); stack.add(root); long last=0;
+			while(!stack.isEmpty()&&!cancel[0]){ File d=stack.remove(stack.size()-1); if(isSymlink(d)) continue; t[1]++; File[] c=d.listFiles(); if(c==null)continue; for(int i=0;i<c.length&&!cancel[0];i++){ File q=c[i]; if(q.isDirectory()&&!isSymlink(q)) stack.add(q); else if(q.isFile()){ t[0]++; long z=Math.max(0,q.length()); t[2]+=z; String k=fileCategory(q); for(int j=0;j<cn.length;j++)if(cn[j].equals(k)){cat[j]+=z;break;} int pos=0; while(pos<biggest.size()&&biggest.get(pos).length()>=z)pos++; biggest.add(pos,q); if(biggest.size()>10)biggest.remove(biggest.size()-1); if(System.currentTimeMillis()-last>300){last=System.currentTimeMillis(); final long fc=t[0],bc=t[2]; uiPost(new Runnable(){public void run(){if(!cancel[0])progress.setText("Scanning...\n"+fc+" files\n"+human(bc));}}); } } } }
+			if(cancel[0])return; final StringBuilder m=new StringBuilder(); m.append("Files: ").append(t[0]).append("\nFolders: ").append(t[1]).append("\nTotal size: ").append(human(t[2])).append("\n\nCategories:\n");
+			for(int j=0;j<cn.length;j++){ if(cat[j]>0){ long pc=t[2]==0?0:(cat[j]*100/t[2]); m.append(cn[j]).append(": ").append(human(cat[j])).append(" (").append(pc).append("%)\n"); }}
+			m.append("\nLargest files:\n"); for(int j=0;j<biggest.size();j++)m.append(j+1).append(". ").append(human(biggest.get(j).length())).append("  ").append(biggest.get(j).getAbsolutePath()).append("\n");
+			uiPost(new Runnable(){public void run(){try{scan.dismiss();}catch(Exception e){} showMessageDialog("Storage analyzer",m.toString());}});
+		}}).start();
+	}
+
+	void showDuplicateFinder(final File root) {
+		if(root==null||!root.isDirectory()||root instanceof MegaItem||root instanceof ZipItem){toast("Select a local folder");return;}
+		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*20,dp*14,dp*20,dp*14); progress.setText("Scanning file sizes..."); themeDialogView(progress);
+		final AlertDialog scan=createDialog("Duplicate finder",null).setView(progress).setNegativeButton("Cancel",new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){cancel[0]=true;}}).create(); scan.show();
+		new Thread(new Runnable(){public void run(){
+			HashMap<Long,ArrayList<File> > sizes=new HashMap<Long,ArrayList<File> >(); ArrayList<File> stack=new ArrayList<File>(); stack.add(root); long files=0;
+			while(!stack.isEmpty()&&!cancel[0]){File d=stack.remove(stack.size()-1);if(isSymlink(d))continue;File[] a=d.listFiles();if(a==null)continue;for(int i=0;i<a.length;i++){File f=a[i];if(f.isDirectory()&&!isSymlink(f))stack.add(f);else if(f.isFile()&&f.length()>0){files++;Long z=Long.valueOf(f.length());ArrayList<File> g=sizes.get(z);if(g==null){g=new ArrayList<File>();sizes.put(z,g);}g.add(f);}}}
+			if(cancel[0])return; HashMap<String,ArrayList<File> > groups=new HashMap<String,ArrayList<File> >(); long hashed=0;
+			for(Map.Entry<Long,ArrayList<File> > e:sizes.entrySet()){ArrayList<File> g=e.getValue();if(g.size()<2)continue;for(int i=0;i<g.size()&&!cancel[0];i++){File f=g.get(i);try{String h=e.getKey()+":"+digestFile(f,"SHA-256");ArrayList<File> q=groups.get(h);if(q==null){q=new ArrayList<File>();groups.put(h,q);}q.add(f);}catch(Exception ex){} hashed++; if(hashed%5==0){final long hh=hashed;uiPost(new Runnable(){public void run(){if(!cancel[0])progress.setText("Verifying same-size files...\nHashed: "+hh);}});}}}
+			if(cancel[0])return; final StringBuilder out=new StringBuilder(); long reclaim=0;int ng=0;for(Map.Entry<String,ArrayList<File> > e:groups.entrySet()){ArrayList<File> g=e.getValue();if(g.size()<2)continue;ng++;long z=g.get(0).length();reclaim+=z*(g.size()-1);out.append("Group ").append(ng).append(" - ").append(human(z)).append(" each\n");for(int i=0;i<g.size();i++)out.append("  ").append(g.get(i).getAbsolutePath()).append("\n");out.append("\n");}
+			final int fg=ng;final long fr=reclaim,ff=files;uiPost(new Runnable(){public void run(){try{scan.dismiss();}catch(Exception e){} if(fg==0)showMessageDialog("Duplicate finder","No duplicate files found.\nScanned "+ff+" files.");else showMessageDialog("Duplicate finder",fg+" duplicate groups\nPotentially reclaimable: "+human(fr)+"\n\n"+out.toString()+"\nNothing is deleted automatically.");}});
+		}}).start();
+	}
+
+	void batchRename() {
+		final ArrayList<File> items=multiItems(); if(items.isEmpty()){toast("Nothing selected");return;}
+		for(int i=0;i<items.size();i++) if(items.get(i) instanceof MegaItem || items.get(i) instanceof ZipItem){toast("Batch rename supports local items only");return;}
+		final EditText input=new EditText(this); input.setHint("Prefix (example: trip_)"); input.setSingleLine(true); themeDialogView(input);
+		createDialog("Batch rename", "Add a prefix to " + items.size() + " selected items. Existing names are kept.").setView(input).setPositiveButton("Rename", new DialogInterface.OnClickListener(){ public void onClick(DialogInterface d,int w){ String pre=input.getText().toString(); if(pre.length()==0){toast("Prefix is empty");return;} int ok=0,bad=0; for(int i=0;i<items.size();i++){File f=items.get(i); File to=new File(f.getParentFile(),pre+f.getName()); if(to.exists()||!f.renameTo(to))bad++;else ok++;} exitMulti(); listCache.clear(); refresh(); toast("Renamed "+ok+(bad>0?", failed "+bad:"")); }}).setNegativeButton("Cancel",null).show();
+	}
+
+	void testArchive(final File item) {
+		if(item==null||item instanceof MegaItem){toast("Select a local ZIP/APK");return;} final File z=item instanceof ZipItem?((ZipItem)item).zip:item;
+		if(z==null||!z.isFile()||!ZipItem.isZipName(z.getName())){toast("Select a ZIP/APK file");return;}
+		final boolean[] cancel={false};final TextView p=new TextView(this);p.setPadding(20*dp,14*dp,20*dp,14*dp);p.setText("Testing archive...");themeDialogView(p);
+		final AlertDialog dlg=createDialog("Archive integrity",null).setView(p).setNegativeButton("Cancel",new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){cancel[0]=true;}}).create();dlg.show();
+		new Thread(new Runnable(){public void run(){String result;ZipFile zip=null;try{zip=new ZipFile(z);java.util.Enumeration<? extends ZipEntry> en=zip.entries();byte[] b=new byte[65536];int entries=0;long bytes=0;while(en.hasMoreElements()&&!cancel[0]){ZipEntry e=en.nextElement();entries++;if(!e.isDirectory()){InputStream in=zip.getInputStream(e);try{int n;while((n=in.read(b))>0){bytes+=n;if(cancel[0])break;}}finally{in.close();}}if(entries%20==0){final int fe=entries;final long fb=bytes;uiPost(new Runnable(){public void run(){if(!cancel[0])p.setText("Testing...\n"+fe+" entries\n"+human(fb)+" read");}});}}result=cancel[0]?"Cancelled":"Archive passed integrity test.\nEntries tested: "+entries+"\nUncompressed data read: "+human(bytes);}catch(Exception e){result="Archive test FAILED.\n"+(e.getMessage()==null?e.toString():e.getMessage());}finally{if(zip!=null)try{zip.close();}catch(Exception e){}}final String r=result;uiPost(new Runnable(){public void run(){try{dlg.dismiss();}catch(Exception e){}if(!cancel[0])showMessageDialog("Archive integrity - "+z.getName(),r);}});}}).start();
+	}
+
+	String yesNo(boolean v) { return v ? "Yes" : "No"; }
+
+	String mimeFor(File f) {
+		String e = extOf(f);
+		String m = e.length() == 0 ? null : MimeTypeMap.getSingleton().getMimeTypeFromExtension(e);
+		return m == null ? "Unknown" : m;
+	}
+
+	String digestBytes(byte[] data, String alg) throws Exception {
+		MessageDigest md = MessageDigest.getInstance(alg);
+		byte[] d = md.digest(data);
+		StringBuilder x = new StringBuilder();
+		for (int i = 0; i < d.length; i++) {
+			String h = Integer.toHexString(d[i] & 255);
+			if (h.length() < 2) x.append('0');
+			x.append(h);
+		}
+		return x.toString();
+	}
+
+	String imageDetails(File f) {
+		String e = extOf(f);
+		if (!(e.equals("jpg") || e.equals("jpeg") || e.equals("png") || e.equals("gif") || e.equals("webp") || e.equals("bmp"))) return "";
+		try {
+			BitmapFactory.Options o = new BitmapFactory.Options();
+			o.inJustDecodeBounds = true;
+			BitmapFactory.decodeFile(f.getAbsolutePath(), o);
+			if (o.outWidth > 0 && o.outHeight > 0) return "\nDimensions: " + o.outWidth + " x " + o.outHeight;
+		} catch (Exception ex) {}
+		return "";
+	}
+
+	String zipDetails(File f) {
+		if (!ZipItem.isZipName(f.getName())) return "";
+		ZipFile z = null;
+		try {
+			z = new ZipFile(f);
+			int files = 0, folders = 0;
+			long unpacked = 0;
+			Enumeration<? extends ZipEntry> en = z.entries();
+			while (en.hasMoreElements()) {
+				ZipEntry e = en.nextElement();
+				if (e.isDirectory()) folders++; else { files++; if (e.getSize() > 0) unpacked += e.getSize(); }
+			}
+			String ratio = f.length() > 0 && unpacked > 0 ? "\nCompression ratio: " + ((f.length() * 100L) / unpacked) + "% of original" : "";
+			return "\nArchive entries: " + files + " files, " + folders + " folders\nUncompressed size: " + human(unpacked) + ratio;
+		} catch (Exception ex) {
+			return "\nArchive status: Cannot read archive (" + (ex.getMessage() == null ? "error" : ex.getMessage()) + ")";
+		} finally { try { if (z != null) z.close(); } catch (Exception ex) {} }
+	}
+
+	String apkDetails(File apk) {
+		if (!extOf(apk).equals("apk")) return "";
+		StringBuilder m = new StringBuilder();
+		try {
+			PackageManager pm = getPackageManager();
+			PackageInfo pi = pm.getPackageArchiveInfo(apk.getAbsolutePath(), PackageManager.GET_PERMISSIONS | PackageManager.GET_SIGNATURES);
+			if (pi == null) return "\nAPK: Package information unavailable";
+			ApplicationInfo ai = pi.applicationInfo;
+			if (ai != null) { ai.sourceDir = apk.getAbsolutePath(); ai.publicSourceDir = apk.getAbsolutePath(); }
+			String label = null;
+			try { if (ai != null) label = String.valueOf(pm.getApplicationLabel(ai)); } catch (Exception ex) {}
+			if (label != null && label.length() > 0) m.append("\nApp name: ").append(label);
+			m.append("\nPackage: ").append(pi.packageName == null ? "Unknown" : pi.packageName);
+			m.append("\nVersion: ").append(pi.versionName == null ? "Unknown" : pi.versionName).append(" (").append(pi.versionCode).append(")");
+			if (ai != null) {
+				if (Build.VERSION.SDK_INT >= 24) m.append("\nMin SDK: ").append(ai.minSdkVersion);
+				m.append("\nTarget SDK: ").append(ai.targetSdkVersion);
+			}
+			boolean installed = false;
+			try { pm.getPackageInfo(pi.packageName, 0); installed = true; } catch (Exception ex) {}
+			m.append("\nInstalled: ").append(yesNo(installed));
+			if (pi.requestedPermissions != null) {
+				m.append("\nPermissions: ").append(pi.requestedPermissions.length);
+				int lim = Math.min(pi.requestedPermissions.length, 12);
+				for (int i = 0; i < lim; i++) m.append("\n  ").append(pi.requestedPermissions[i]);
+				if (pi.requestedPermissions.length > lim) m.append("\n  ... +").append(pi.requestedPermissions.length - lim).append(" more");
+			}
+			if (pi.signatures != null && pi.signatures.length > 0) {
+				m.append("\nSignatures: ").append(pi.signatures.length);
+				m.append("\nCertificate SHA-256: ").append(digestBytes(pi.signatures[0].toByteArray(), "SHA-256"));
+			}
+		} catch (Exception ex) { m.append("\nAPK info error: ").append(ex.getMessage() == null ? ex.toString() : ex.getMessage()); }
+		return m.toString();
+	}
+
+	void showLocalAdvancedInfo(final File f) {
+		final AlertDialog wait = busyDialog("Info", f.isDirectory() ? "Calculating folder information..." : "Reading file information...");
+		new Thread(new Runnable() { public void run() {
+			DateFormat df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+			final StringBuilder m = new StringBuilder();
+			m.append("Path: ").append(f.getAbsolutePath());
+			m.append("\nType: ").append(f.isDirectory() ? "Folder" : "File");
+			if (!f.isDirectory()) m.append("\nMIME: ").append(mimeFor(f));
+			if (f.isDirectory()) {
+				long[] t = new long[3];
+				try { tally(f, t); } catch (Exception ex) {}
+				m.append("\nFiles: ").append(t[0]).append("\nFolders: ").append(t[1]).append("\nTotal size: ").append(human(t[2]));
+			} else m.append("\nSize: ").append(human(f.length())).append(" (").append(f.length()).append(" bytes)");
+			m.append("\nModified: ").append(df.format(new Date(f.lastModified())));
+			m.append("\nReadable: ").append(yesNo(f.canRead())).append("\nWritable: ").append(yesNo(f.canWrite()));
+			m.append("\nHidden: ").append(yesNo(f.isHidden()));
+			if (!f.isDirectory()) {
+				m.append(imageDetails(f));
+				m.append(zipDetails(f));
+				m.append(apkDetails(f));
+				try { m.append("\n\nSHA-256:\n").append(digestFile(f, "SHA-256")); } catch (Exception ex) { m.append("\n\nSHA-256: unavailable"); }
+				try { m.append("\n\nMD5:\n").append(digestFile(f, "MD5")); } catch (Exception ex) { m.append("\n\nMD5: unavailable"); }
+			}
+			uiPost(new Runnable() { public void run() {
+				try { wait.dismiss(); } catch (Exception ex) {}
+				createDialog(f.getName(), m.toString()).setPositiveButton("Copy", new DialogInterface.OnClickListener() { public void onClick(DialogInterface d, int w) {
+					ClipboardManager cm = (ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+					cm.setPrimaryClip(ClipData.newPlainText("File information", m.toString())); toast("Information copied");
+				}}).setNegativeButton("Close", null).show();
+			} });
+		} }).start();
+	}
+
 	void info() {
 		DateFormat df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
 		if (selected instanceof DexItem) {
 			DexItem di = (DexItem) selected;
-			String kind = di.isDexRoot() ? "Dex file" : di.kind == 1 ? "Class" : di.kind == 2 ? "Fields"
-					: di.kind == 3 ? "Methods" : "Field or method";
+			String kind = di.isDexRoot() ? "Dex file" : di.kind == 1 ? "Class" : di.kind == 2 ? "Fields" : di.kind == 3 ? "Methods" : "Field or method";
 			StringBuilder msg = new StringBuilder();
-			msg.append("In: ").append(di.zip.getAbsolutePath()).append("!/").append(di.dexEntry);
-			msg.append("\nType: ").append(kind);
-			if (!di.isDexRoot())
-				msg.append("\nPath: ").append(di.virtualPath);
-			if (di.kind == 4)			
-				msg.append("\n\n").append(di.getName());
-			msg.append("\nBrowse-only");
-			showMessageDialog(di.getName(), msg.toString());
-			return;
+			msg.append("In: ").append(di.zip.getAbsolutePath()).append("!/").append(di.dexEntry).append("\nType: ").append(kind);
+			if (!di.isDexRoot()) msg.append("\nPath: ").append(di.virtualPath);
+			if (di.kind == 4) msg.append("\n\n").append(di.getName());
+			msg.append("\nBrowse-only"); showMessageDialog(di.getName(), msg.toString()); return;
 		}
 		if (selected instanceof ZipItem) {
 			ZipItem zi = (ZipItem) selected;
-			showMessageDialog(zi.getName(), "In zip: " + zi.zip.getAbsolutePath() + "\nEntry: " + zi.entry + "\nType: "
-							+ (zi.isDirectory() ? "Folder" : "File")
-							+ (zi.isDirectory() ? "" : "\nSize: " + human(zi.length())) + "\nModified: "
-							+ df.format(new Date(zi.lastModified())) + "\nRead-only");
-			return;
+			if (zi.isRoot()) { showLocalAdvancedInfo(zi.zip); return; }
+			showMessageDialog(zi.getName(), "In zip: " + zi.zip.getAbsolutePath() + "\nEntry: " + zi.entry + "\nType: " + (zi.isDirectory() ? "Folder" : "File") + (zi.isDirectory() ? "" : "\nSize: " + human(zi.length())) + "\nModified: " + df.format(new Date(zi.lastModified())) + "\nRead-only"); return;
 		}
-		showMessageDialog(selected.getName(), "Path: " + selected.getAbsolutePath() + "\nType: "
-						+ (selected.isDirectory() ? "Folder" : "File") + "\nSize: " + human(selected.length())
-						+ "\nModified: " + df.format(new Date(selected.lastModified())) + "\nReadable: "
-						+ selected.canRead() + "\nWritable: " + selected.canWrite());
+		if (selected instanceof MegaItem) {
+			showMessageDialog(selected.getName(), "Path: " + selected.getAbsolutePath() + "\nType: " + (selected.isDirectory() ? "Folder" : "File") + "\nSize: " + human(selected.length()) + "\nModified: " + df.format(new Date(selected.lastModified())) + "\nCloud item"); return;
+		}
+		showLocalAdvancedInfo(selected);
 	}
 
 	void requestAccess() {
