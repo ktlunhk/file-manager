@@ -70,7 +70,7 @@ class FileOperations {
 
         long sizeOf(File f) throws IOException {
             if (cancelled) throw new InterruptedIOException("Cancelled");
-            if (f.isDirectory()) {
+            if (f.isDirectory() && !activity.isSymlink(f)) {
                 long t = 0;
                 File[] c = f.listFiles();
                 if (c != null) for (int i = 0; i < c.length; i++) t += sizeOf(c[i]);
@@ -160,8 +160,9 @@ class FileOperations {
                 } catch (IOException e) {
                     moveFail++;
                 }
-            } else
-                f.delete();
+            } else {
+                if (!f.delete()) moveFail++;
+            }
         }
 
         void finish(final String err) {
@@ -251,7 +252,11 @@ class FileOperations {
 				deleteWithProgress(c[i], done, total, progress);
 		}
 		if (progress.cancelled) return;
-		f.delete();
+		if (!f.delete()) {
+			final String failedName = f.getName();
+			activity.uiPost(new Runnable() { public void run() { activity.toast("Could not delete: " + failedName); } });
+			return;
+		}
 		done[0]++;
 		final long d = done[0];
 		final String name = f.getName();
@@ -269,19 +274,56 @@ class FileOperations {
 		ArrayList<File[]> moved = new ArrayList<File[]>();
 		for (int i = 0; i < targets.size(); i++) {
 			File f = targets.get(i);
-			File root = f.getAbsolutePath().startsWith(activity.rightRoot.getAbsolutePath())
-					&& !f.getAbsolutePath().startsWith(activity.leftRoot.getAbsolutePath()) ? activity.rightRoot : activity.leftRoot;
+			File root = isInside(f, activity.rightRoot) && !isInside(f, activity.leftRoot) ? activity.rightRoot : activity.leftRoot;
 			File t = trashDir(root);
 			t.mkdirs();
 			File dst = uniqueInDir(t, f.getName());
-			if (f.renameTo(dst))
+			if (f.renameTo(dst)) {
 				moved.add(new File[]{f, dst});
-			else {
-				delete(f);
-				moved.add(new File[]{f, null});
-			} // couldn't move: gone for good
+			} else {
+				// renameTo can fail across filesystems. Never turn a failed trash move into a permanent delete.
+				try {
+					copyTreeVerified(f, dst);
+					if (!deleteChecked(f)) { deleteChecked(dst); moved.add(new File[]{f, null}); }
+					else moved.add(new File[]{f, dst});
+				} catch (IOException e) {
+					deleteChecked(dst);
+					moved.add(new File[]{f, null});
+				}
+			}
 		}
 		return moved;
+	}
+
+	boolean isInside(File child, File parent) {
+		if (child == null || parent == null) return false;
+		try {
+			String c = child.getCanonicalPath();
+			String p = parent.getCanonicalPath();
+			return c.equals(p) || c.startsWith(p + File.separator);
+		} catch (IOException e) { return false; }
+	}
+
+	void copyTreeVerified(File src, File dst) throws IOException {
+		if (activity.isSymlink(src)) throw new IOException("Refusing to follow symbolic link");
+		if (src.isDirectory()) {
+			if (!dst.exists() && !dst.mkdirs()) throw new IOException("Cannot create " + dst.getName());
+			File[] kids = src.listFiles();
+			if (kids == null && src.canRead()) throw new IOException("Cannot list " + src.getName());
+			if (kids != null) for (int i=0;i<kids.length;i++) copyTreeVerified(kids[i], new File(dst, kids[i].getName()));
+		} else {
+			InputStream in = new FileInputStream(src); OutputStream out = null; long nsum=0;
+			try { out = new FileOutputStream(dst); byte[] b=new byte[65536]; int n; while((n=in.read(b))>0){out.write(b,0,n); nsum+=n;} out.flush(); }
+			finally { try{in.close();}catch(Exception e){} if(out!=null)try{out.close();}catch(Exception e){} }
+			if (nsum != src.length() || dst.length() != src.length()) throw new IOException("Verification failed for " + src.getName());
+			dst.setLastModified(src.lastModified());
+		}
+	}
+
+	boolean deleteChecked(File f) {
+		if (f == null || !f.exists()) return true;
+		if (f.isDirectory() && !activity.isSymlink(f)) { File[] c=f.listFiles(); if(c!=null) for(int i=0;i<c.length;i++) if(!deleteChecked(c[i])) return false; }
+		return f.delete();
 	}
 
 	File uniqueInDir(File dir, String name) {
@@ -311,9 +353,10 @@ class FileOperations {
 		volatile boolean cancelled;
 		volatile long done, total;
 		volatile String cur = "Preparing...";
-		int policy; // 0 = ask, 1 = overwrite all, 2 = skip all
+		int policy; // 0 = ask, 1 = overwrite all, 2 = skip all, 3 = keep both all
 		int files, copied, skipped, moveFail;
 		long lastUi;
+		long startedAt;
 		OperationProgress operationProgress;
 		final Runnable updater;
 		ZipItem dstZip; // non-null: destination is a folder inside a zip (or the zip itself)
@@ -334,12 +377,20 @@ class FileOperations {
 				public void run() {
 					if (operationProgress == null) return;
 					int pct = total > 0 ? (int) Math.min(1000L, done * 1000L / total) : 0;
-					operationProgress.update(cur, done, total, (pct / 10) + "%   " + activity.human(done) + " / " + activity.human(total));
+					long elapsed = Math.max(1L, System.currentTimeMillis() - startedAt);
+					long speed = done > 0 ? done * 1000L / elapsed : 0L;
+					long remain = speed > 0 && total > done ? (total - done) / speed : -1L;
+					int itemNo = Math.min(files, copied + skipped + 1);
+					String eta = remain >= 0 ? "   ETA " + formatDuration(remain) : "";
+					String count = files > 0 ? "   " + itemNo + " / " + files + " files" : "";
+					String rate = speed > 0 ? "   " + activity.human(speed) + "/s" : "";
+					operationProgress.update(cur, done, total, (pct / 10) + "%   " + activity.human(done) + " / " + activity.human(total) + count + rate + eta);
 				}
 			};
 		}
 
 		void start() {
+			startedAt = System.currentTimeMillis();
 			operationProgress = new OperationProgress(activity, title, true, true, activity.dp, new Runnable() {
 				public void run() {
 					cancelled = true;
@@ -355,8 +406,18 @@ class FileOperations {
 							addToZip();
 						} else {
 							total = 0;
-							for (int i = 0; i < srcs.size(); i++)
-								total += sizeOf(srcs.get(i));
+							for (int i = 0; i < srcs.size(); i++) {
+								File vs = srcs.get(i);
+								File vd = dsts.get(i);
+								if (!(vs instanceof ZipItem) && !(vs instanceof MegaItem) && !(vd instanceof ZipItem) && !(vd instanceof MegaItem)) {
+									String sp = vs.getCanonicalPath();
+									String dp = vd.getCanonicalPath();
+									if (sp.equals(dp)) throw new IOException("Source and destination are the same");
+									if (vs.isDirectory() && dp.startsWith(sp + File.separator))
+										throw new IOException("Cannot copy a folder inside itself");
+								}
+								total += sizeOf(vs);
+							}
 							tick(true);
 							for (int i = 0; i < srcs.size(); i++)
 								copyNode(srcs.get(i), dsts.get(i));
@@ -371,6 +432,13 @@ class FileOperations {
 			}).start();
 		}
 
+		String formatDuration(long seconds) {
+			if (seconds < 60) return seconds + "s";
+			long minutes = seconds / 60;
+			if (minutes < 60) return minutes + "m " + (seconds % 60) + "s";
+			return (minutes / 60) + "h " + (minutes % 60) + "m";
+		}
+
 		void tick(boolean force) {
 			long now = System.currentTimeMillis();
 			if (!force && now - lastUi < 100)
@@ -382,7 +450,7 @@ class FileOperations {
 		long sizeOf(File f) throws IOException {
 			if (cancelled)
 				throw new InterruptedIOException("Cancelled");
-			if (f.isDirectory()) {
+			if (f.isDirectory() && !activity.isSymlink(f)) {
 				long t = 0;
 				File[] c = f.listFiles();
 				if (c != null)
@@ -397,7 +465,7 @@ class FileOperations {
 		void copyNode(File s, File d) throws IOException {
 			if (cancelled)
 				throw new InterruptedIOException("Cancelled");
-			if (s.isDirectory()) {
+			if (s.isDirectory() && !activity.isSymlink(s)) {
 				if (d.exists() && !d.isDirectory())
 					throw new IOException("A file named \"" + d.getName() + "\" is in the way");
 				if (!d.exists() && !d.mkdirs())
@@ -408,8 +476,8 @@ class FileOperations {
 						copyNode(c[i], new File(d, c[i].getName()));
 				if (move && !(s instanceof ZipItem) && !(s instanceof MegaItem)) {
 					File[] left = s.listFiles();
-					if (left != null && left.length == 0)
-						s.delete();
+					if (left != null && left.length == 0 && !s.delete())
+						moveFail++;
 				} else if (move && s instanceof MegaItem && !((MegaItem) s).isSystemNode()) {
 					File[] left = s.listFiles();
 					if (left != null && left.length == 0) {
@@ -424,17 +492,12 @@ class FileOperations {
 			}
 			boolean over = false;
 			if (d.exists()) {
-				if (d.isDirectory())
-					throw new IOException("A folder named \"" + d.getName() + "\" is in the way");
-				if (!resolve(s, d)) {
-					skipped++;
-					done += Math.max(s.length(), 0L);
-					tick(false);
-					return;
-				}
-				if (cancelled)
-					throw new InterruptedIOException("Cancelled");
-				over = true;
+				if (d.isDirectory()) throw new IOException("A folder named \"" + d.getName() + "\" is in the way");
+				int decision = resolveAction(s, d);
+				if (decision == 2) { skipped++; done += Math.max(s.length(), 0L); tick(false); return; }
+				if (decision == 3 || cancelled) throw new InterruptedIOException("Cancelled");
+				if (decision == 4) d = uniqueInDir(d.getParentFile(), d.getName());
+				else over = true;
 			}
 			cur = s.getName();
 			tick(true);
@@ -453,8 +516,12 @@ class FileOperations {
 		}
 
 		void copyData(File s, File d, boolean over) throws IOException {
-			// when overwriting, write to a temp file first so a failure/cancel keeps the original
-			File target = over ? new File(d.getParentFile(), d.getName() + ".dfm-part") : d;
+			// Always write local output to a temporary file first. A cancelled or failed copy never leaves a partial destination.
+			File parent = d.getParentFile();
+			if (parent == null) throw new IOException("Invalid destination");
+			File target = new File(parent, d.getName() + ".dfm-part");
+			int partNo = 2;
+			while (target.exists()) target = new File(parent, d.getName() + ".dfm-part-" + (partNo++));
 			InputStream in = null;
 			OutputStream out = null;
 			PZip zf = null;
@@ -464,50 +531,42 @@ class FileOperations {
 					ZipItem zi = (ZipItem) s;
 					zf = new PZip(zi.zip);
 					PEntry ze = zf.getEntry(zi.entry);
-					if (ze == null)
-						throw new IOException("Entry not found: " + zi.entry);
+					if (ze == null) throw new IOException("Entry not found: " + zi.entry);
 					in = zf.getInputStream(ze);
-				} else if (s instanceof MegaItem)
-					in = ((MegaItem) s).openStream();
-				else
-					in = new FileInputStream(s);
-				out = new FileOutputStream(target);
+				} else if (s instanceof MegaItem) in = ((MegaItem) s).openStream();
+				else in = new FileInputStream(s);
+				out = new BufferedOutputStream(new FileOutputStream(target));
 				byte[] buf = new byte[65536];
 				int n;
 				while ((n = in.read(buf)) > 0) {
-					if (cancelled)
-						throw new InterruptedIOException("Cancelled");
+					if (cancelled) throw new InterruptedIOException("Cancelled");
 					out.write(buf, 0, n);
 					done += n;
 					tick(false);
 				}
-				out.close();
-				out = null;
-				if (over) {
-					if (!d.delete())
-						throw new IOException("Cannot replace " + d.getName());
-					if (!target.renameTo(d))
-						throw new IOException("Cannot rename temp file");
+				out.flush();
+				out.close(); out = null;
+				if (!(s instanceof ZipItem) && !(s instanceof MegaItem) && target.length() != s.length())
+					throw new IOException("Copy verification failed for " + s.getName());
+
+				File backup = null;
+				if (d.exists()) {
+					backup = new File(parent, d.getName() + ".dfm-old");
+					int oldNo = 2;
+					while (backup.exists()) backup = new File(parent, d.getName() + ".dfm-old-" + (oldNo++));
+					if (!d.renameTo(backup)) throw new IOException("Cannot safely replace " + d.getName());
 				}
+				if (!target.renameTo(d)) {
+					if (backup != null) backup.renameTo(d);
+					throw new IOException("Cannot finalize " + d.getName());
+				}
+				if (backup != null) deleteChecked(backup);
 				ok = true;
 			} finally {
-				if (in != null)
-					try {
-						in.close();
-					} catch (IOException e) {
-					}
-				if (out != null)
-					try {
-						out.close();
-					} catch (IOException e) {
-					}
-				if (zf != null)
-					try {
-						zf.close();
-					} catch (IOException e) {
-					}
-				if (!ok)
-					target.delete();
+				if (in != null) try { in.close(); } catch (IOException e) { }
+				if (out != null) try { out.close(); } catch (IOException e) { }
+				if (zf != null) try { zf.close(); } catch (IOException e) { }
+				if (!ok) target.delete();
 			}
 		}
 
@@ -516,23 +575,21 @@ class FileOperations {
 			return activity.human(Math.max(size, 0L)) + ", " + df.format(new Date(time));
 		}
 
-		boolean resolve(File s, File d) {
+		int resolveAction(File s, File d) {
 			File par = d.getParentFile();
-			return ask(d.getName(), par != null ? par.getName() : null, stamp(d.length(), d.lastModified()),
-					stamp(s.length(), s.lastModified()));
+			return ask(d.getName(), par != null ? par.getName() : null, stamp(d.length(), d.lastModified()), stamp(s.length(), s.lastModified()));
 		}
 
-		// Called on the worker thread: shows the dialog on the UI thread and waits.
-		boolean ask(final String name, final String where, final String exInfo, final String newInfo) {
-			if (policy == 1)
-				return true;
-			if (policy == 2)
-				return false;
+		// 1 overwrite, 2 skip, 3 cancel, 4 keep both. Called on worker thread and waits for UI choice.
+		int ask(final String name, final String where, final String exInfo, final String newInfo) {
+			if (policy == 1) return 1;
+			if (policy == 2) return 2;
+			if (policy == 3) return 4;
 			final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
 			final int[] choice = {0}; // 1 overwrite, 2 skip, 3 cancel
 			if (activity.isFinishing()) { // screen was recreated: the dialog cannot be shown
 				cancelled = true;
-				return false;
+				return 3;
 			}
 			activity.uiPost(new Runnable() {
 				public void run() {
@@ -542,7 +599,8 @@ class FileOperations {
 					final CheckBox all = new CheckBox(b.getContext());
 					activity.themeDialogView(all);
 					all.setText("Apply to all (" + files + " files)");
-					b.setCancelable(false);
+					b.setCancelable(true);
+					b.setOnCancelListener(new DialogInterface.OnCancelListener() { public void onCancel(DialogInterface di) { choice[0] = 3; cancelled = true; latch.countDown(); } });
 					if (files > 1) {
 						android.widget.FrameLayout allBox = new android.widget.FrameLayout(b.getContext());
 						activity.padDialogBox(allBox);
@@ -555,6 +613,8 @@ class FileOperations {
 								choice[0] = 1;
 							else if (which == DialogInterface.BUTTON_NEGATIVE)
 								choice[0] = 2;
+							else if (which == DialogInterface.BUTTON_NEUTRAL)
+								choice[0] = 4;
 							else
 								choice[0] = 3;
 							if (all.isChecked()) {
@@ -566,7 +626,7 @@ class FileOperations {
 							latch.countDown();
 						}
 					};
-					b.setPositiveButton("Overwrite", l).setNegativeButton("Skip", l).setNeutralButton("Cancel", l);
+					b.setPositiveButton("Overwrite", l).setNegativeButton("Skip", l).setNeutralButton("Keep both", l);
 					b.show();
 				}
 			});
@@ -574,13 +634,9 @@ class FileOperations {
 				latch.await();
 			} catch (InterruptedException e) {
 				cancelled = true;
-				return false;
+				return 3;
 			}
-			if (choice[0] == 3) {
-				cancelled = true;
-				return false;
-			}
-			return choice[0] == 1;
+			return choice[0];
 		}
 
 		// ---- copying INTO a zip (rewrites the zip: old entries + new ones) ----
@@ -620,6 +676,22 @@ class FileOperations {
 				done += n;
 				tick(false);
 			}
+		}
+
+		String uniqueZipEntryName(String name, HashMap<String, long[]> exist, HashSet<String> dirSet) {
+			int slash = name.lastIndexOf('/');
+			String path = slash >= 0 ? name.substring(0, slash + 1) : "";
+			String base = slash >= 0 ? name.substring(slash + 1) : name;
+			int dot = base.lastIndexOf('.');
+			String stem = dot > 0 ? base.substring(0, dot) : base;
+			String ext = dot > 0 ? base.substring(dot) : "";
+			int n = 2;
+			String candidate = path + stem + " (" + n + ")" + ext;
+			while (exist.containsKey(candidate) || dirSet.contains(candidate)) {
+				n++;
+				candidate = path + stem + " (" + n + ")" + ext;
+			}
+			return candidate;
 		}
 
 		void addToZip() throws IOException {
@@ -679,8 +751,15 @@ class FileOperations {
 					long[] ex = exist.get(it.name);
 					if (ex != null) {
 						String nm = it.s.getName();
-						if (ask(nm, zip.getName(), stamp(ex[0], ex[1]), stamp(it.s.length(), it.s.lastModified()))) {
+						int action = ask(nm, zip.getName(), stamp(ex[0], ex[1]), stamp(it.s.length(), it.s.lastModified()));
+						if (action == 1) {
 							it.replace = true;
+						} else if (action == 4) {
+							it.name = uniqueZipEntryName(it.name, exist, dirSet);
+							exist.put(it.name, new long[]{it.s.length(), it.s.lastModified()});
+						} else if (action == 3) {
+							cancelled = true;
+							throw new InterruptedIOException("Cancelled");
 						} else {
 							it.skip = true;
 							skipped++;
@@ -782,10 +861,15 @@ class FileOperations {
 				zo = null;
 				zf.close();
 				zf = null;
-				if (!zip.delete())
-					throw new IOException("Cannot replace zip");
-				if (!tmp.renameTo(zip))
-					throw new IOException("Cannot rename temp zip");
+				File oldZip = new File(zip.getParentFile(), zip.getName() + ".dfm-old");
+				int oldNo = 2;
+				while (oldZip.exists()) oldZip = new File(zip.getParentFile(), zip.getName() + ".dfm-old-" + (oldNo++));
+				if (!zip.renameTo(oldZip)) throw new IOException("Cannot safely replace zip");
+				if (!tmp.renameTo(zip)) {
+					oldZip.renameTo(zip);
+					throw new IOException("Cannot finalize temp zip");
+				}
+				deleteChecked(oldZip);
 				ok = true;
 			} finally {
 				if (zo != null)
