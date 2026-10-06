@@ -546,14 +546,10 @@ class PreviewManager {
 	}
 
 	void showTextPreview(final File f) {
-		if (f.length() > PREVIEW_TEXT_MAX) {
-			activity.toast("File too large to preview inline - opening externally");
-			activity.openItem(f, false);
-			return;
-		}
+		final boolean truncated = f.length() > PREVIEW_TEXT_MAX;
 		byte[] bytes;
 		try {
-			bytes = readAllBytes(f);
+			bytes = truncated ? readPrefixBytes(f, (int)PREVIEW_TEXT_MAX) : readAllBytes(f);
 		} catch (Exception e) {
 			activity.toast("Can't preview this file");
 			activity.openItem(f, false);
@@ -589,13 +585,16 @@ class PreviewManager {
 		String nm = f.getName();
 		int dot = nm.lastIndexOf('.');
 		String ext = dot >= 0 ? nm.substring(dot + 1) : "";
-		new TextViewer(f, content, ext).show();
+		if (truncated) activity.toast("Large file: showing first 2 MB in read-only mode");
+		new TextViewer(f, content, ext, !truncated && !looksBinary(bytes)).show();
 	}
 
 	/** Text preview with wrap toggle, find-in-text, copy and syntax colouring. */
 	class TextViewer {
 		final File file;
-		final String content, ext;
+		String content;
+		final String ext;
+		String encoding = "UTF-8";
 		PreviewTextView tv;
 		LineNumberView lineNums;
 		TextView wrapBtn, countTv;
@@ -607,12 +606,16 @@ class PreviewManager {
 		Object curSpan;
 		int hitLen, cur = -1;
 		boolean capped;
+		final boolean canEdit;
+		boolean dirty;
+		TextView editBtn, saveBtn;
 		static final int MAX_HITS = 5000;
 
-		TextViewer(File f, String content, String ext) {
+		TextViewer(File f, String content, String ext, boolean canEdit) {
 			this.file = f;
 			this.content = content;
 			this.ext = ext;
+			this.canEdit = canEdit;
 		}
 
 		TextView toolBtn(String label) {
@@ -621,9 +624,31 @@ class PreviewManager {
 			b.setTextSize(13);
 			b.setTextColor(activity.colText);
 			b.setGravity(Gravity.CENTER);
-			b.setPadding(10 * activity.dp, 0, 10 * activity.dp, 0);
+			b.setSingleLine(true);
+			b.setHorizontallyScrolling(true);
+			b.setPadding(12 * activity.dp, 0, 12 * activity.dp, 0);
 			activity.applyRipple(b);
 			return b;
+		}
+
+		// TextViewer toolbar only: distribute spare screen width across the action
+		// labels.  Keep a comfortable minimum; if that still does not fit, the
+		// HorizontalScrollView remains the fallback.
+		void updateToolSpacing(int availableWidth, TextView[] buttons) {
+			if (availableWidth <= 0 || buttons == null || buttons.length == 0) return;
+			float textWidth = 0;
+			for (int i = 0; i < buttons.length; i++) {
+				TextView b = buttons[i];
+				if (b != null) textWidth += b.getPaint().measureText(String.valueOf(b.getText()));
+			}
+			int minPad = 12 * activity.dp;
+			int maxPad = 28 * activity.dp;
+			int pad = (int) ((availableWidth - textWidth) / (buttons.length * 2f));
+			if (pad < minPad) pad = minPad;
+			if (pad > maxPad) pad = maxPad;
+			for (int i = 0; i < buttons.length; i++) {
+				if (buttons[i] != null) buttons[i].setPadding(pad, 0, pad, 0);
+			}
 		}
 
 		void show() {
@@ -677,16 +702,44 @@ class PreviewManager {
 			zoomWrap.addView(tv, new LinearLayout.LayoutParams(0, -1, 1));
 			lineNums.setTotalLines(lineCount);
 
-			// ---- tool row: Wrap / Search / Copy ----
+			// ---- tool row: viewer/editor actions ----
 			LinearLayout tools = new LinearLayout(activity);
 			tools.setOrientation(LinearLayout.HORIZONTAL);
 			tools.setBackgroundColor(activity.colSurfaceAlt);
 			wrapBtn = toolBtn("No wrap");
 			TextView searchBtn = toolBtn("Search");
+			TextView goBtn = toolBtn("Go");
+			TextView encBtn = toolBtn("Encoding");
 			TextView copyBtn = toolBtn("Copy");
-			tools.addView(wrapBtn, new LinearLayout.LayoutParams(0, -1, 1));
-			tools.addView(searchBtn, new LinearLayout.LayoutParams(0, -1, 1));
-			tools.addView(copyBtn, new LinearLayout.LayoutParams(0, -1, 1));
+			editBtn = toolBtn("Edit");
+			saveBtn = toolBtn("Save");
+			tools.addView(wrapBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(searchBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(goBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(encBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(copyBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(editBtn, new LinearLayout.LayoutParams(-2, -1));
+			tools.addView(saveBtn, new LinearLayout.LayoutParams(-2, -1));
+			final TextView[] toolButtons = new TextView[] {
+				wrapBtn, searchBtn, goBtn, encBtn, copyBtn, editBtn, saveBtn
+			};
+
+			// Keep every viewer action on one line.  On narrow screens the whole
+			// action strip scrolls horizontally instead of squeezing/wrapping labels.
+			HorizontalScrollView toolsScroll = new HorizontalScrollView(activity);
+			toolsScroll.setFillViewport(true);
+			toolsScroll.setBackgroundColor(activity.colSurfaceAlt);
+			toolsScroll.setHorizontalFadingEdgeEnabled(false);
+			toolsScroll.setHorizontalScrollBarEnabled(true);
+			toolsScroll.addView(tools, new HorizontalScrollView.LayoutParams(-2, -1));
+			toolsScroll.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+				public void onLayoutChange(View v, int left, int top, int right, int bottom,
+						int oldLeft, int oldTop, int oldRight, int oldBottom) {
+					int width = right - left - v.getPaddingLeft() - v.getPaddingRight();
+					updateToolSpacing(width, toolButtons);
+				}
+			});
+			if (!canEdit) { editBtn.setEnabled(false); saveBtn.setEnabled(false); editBtn.setAlpha(0.45f); saveBtn.setAlpha(0.45f); }
 			wrapBtn.setOnClickListener(new View.OnClickListener() {
 				public void onClick(View v) {
 					setWrap(!wrap);
@@ -698,10 +751,32 @@ class PreviewManager {
 					else openSearch();
 				}
 			});
+			goBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) { showGoToLine(); }
+			});
+			encBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) { showEncodingMenu(); }
+			});
 			copyBtn.setOnClickListener(new View.OnClickListener() {
 				public void onClick(View v) {
 					copyText();
 				}
+			});
+
+			editBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) {
+					if (!canEdit) { activity.toast("This preview is read-only"); return; }
+					boolean editing = !tv.isEditable();
+					tv.setEditable(editing);
+					editBtn.setText(editing ? "View" : "Edit");
+					if (editing) {
+						InputMethodManager imm = (InputMethodManager) activity.getSystemService(Context.INPUT_METHOD_SERVICE);
+						if (imm != null) imm.showSoftInput(tv, InputMethodManager.SHOW_IMPLICIT);
+					} else hideKeyboard();
+				}
+			});
+			saveBtn.setOnClickListener(new View.OnClickListener() {
+				public void onClick(View v) { saveText(); }
 			});
 
 			// ---- search bar (hidden until Search is tapped) ----
@@ -768,9 +843,15 @@ class PreviewManager {
 
 			LinearLayout screen = new LinearLayout(activity);
 			screen.setOrientation(LinearLayout.VERTICAL);
-			screen.addView(tools, new LinearLayout.LayoutParams(-1, 40 * activity.dp));
+			screen.addView(toolsScroll, new LinearLayout.LayoutParams(-1, 40 * activity.dp));
 			screen.addView(searchBar, new LinearLayout.LayoutParams(-1, -2));
 			screen.addView(zoomWrap, new LinearLayout.LayoutParams(-1, 0, 1));
+
+			tv.addTextChangedListener(new TextWatcher() {
+				public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+				public void onTextChanged(CharSequence s, int a, int b, int c) { if (tv.isEditable()) dirty = true; }
+				public void afterTextChanged(Editable e) {}
+			});
 
 			setWrap(false);
 			showPreviewScreen(file.getName(), screen, file);
@@ -798,7 +879,7 @@ class PreviewManager {
 					if (fs == null) return;
 					activity.uiPost(new Runnable() {
 						public void run() {
-							if (gen != previewGen) return;
+							if (gen != previewGen || dirty || tv.isEditable()) return;
 							int keepA = tv.getSelectionStart(), keepB = tv.getSelectionEnd();
 							tv.setText(fs, TextView.BufferType.SPANNABLE);
 							// setText moves the cursor to the top: put it back where the user tapped
@@ -815,6 +896,93 @@ class PreviewManager {
 					});
 				}
 			}).start();
+		}
+
+
+		void saveText() {
+			if (!canEdit) { activity.toast("This preview is read-only"); return; }
+			final String text = tv.getText().toString();
+			final String enc = encoding;
+			new Thread(new Runnable() { public void run() {
+				String error = null;
+				File parent = file.getParentFile();
+				File tmp = new File(parent, file.getName() + ".dfm-save-part");
+				File bak = new File(parent, file.getName() + ".dfm-save-backup");
+				try {
+					if (tmp.exists() && !tmp.delete()) throw new IOException("Cannot remove old temporary save file");
+					OutputStreamWriter out = new OutputStreamWriter(new FileOutputStream(tmp), enc);
+					try { out.write(text); out.flush(); } finally { try { out.close(); } catch (Exception e) {} }
+					if (file.exists()) {
+						if (bak.exists() && !bak.delete()) throw new IOException("Cannot remove old save backup");
+						if (!file.renameTo(bak)) throw new IOException("Cannot prepare original file for safe save");
+					}
+					if (!tmp.renameTo(file)) {
+						if (bak.exists()) bak.renameTo(file);
+						throw new IOException("Cannot replace original file");
+					}
+					if (bak.exists()) bak.delete();
+				} catch (Exception e) {
+					error = e.getMessage() == null ? "Save failed" : e.getMessage();
+					if (tmp.exists()) tmp.delete();
+					if (!file.exists() && bak.exists()) bak.renameTo(file);
+				}
+				final String ferr = error;
+				activity.uiPost(new Runnable() { public void run() {
+					if (ferr == null) { content = text; dirty = false; activity.toast("Saved: " + file.getName()); }
+					else activity.createDialog("Save failed", ferr).setPositiveButton("OK", null).show();
+				}});
+			}}).start();
+		}
+
+
+		void showGoToLine() {
+			final EditText input = new EditText(activity);
+			input.setHint("Line number");
+			input.setSingleLine(true);
+			input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+			activity.themeDialogView(input);
+			activity.createDialog("Go to line", null).setView(input)
+				.setPositiveButton("Go", new DialogInterface.OnClickListener() {
+					public void onClick(DialogInterface d, int w) {
+						try {
+							int line = Integer.parseInt(input.getText().toString());
+							if (line < 1) line = 1;
+							int off = 0, curLine = 1;
+							while (curLine < line && off < content.length()) {
+								int n = content.indexOf('\n', off);
+								if (n < 0) { off = content.length(); break; }
+								off = n + 1; curLine++;
+							}
+							final int pos = off;
+							tv.setSelection(Math.min(pos, tv.length()));
+							tv.post(new Runnable(){ public void run(){ tv.revealOffset(pos); lineNums.invalidate(); }});
+						} catch (Exception e) { activity.toast("Enter a valid line number"); }
+					}
+				}).setNegativeButton("Cancel", null).show();
+		}
+
+		void showEncodingMenu() {
+			final String[] encs = {"UTF-8", "UTF-16", "UTF-16LE", "UTF-16BE", "ISO-8859-1", "US-ASCII"};
+			activity.createDialog("Text encoding", "Current: " + encoding).setItems(encs,
+				new DialogInterface.OnClickListener(){ public void onClick(DialogInterface d, int which){ reloadEncoding(encs[which]); }}).show();
+		}
+
+		void reloadEncoding(final String enc) {
+			new Thread(new Runnable(){ public void run(){
+				try {
+				{
+					byte[] b = file.length() > PREVIEW_TEXT_MAX ? readPrefixBytes(file, (int)PREVIEW_TEXT_MAX) : readAllBytes(file);
+					final String decoded = new String(b, enc);
+					activity.uiPost(new Runnable(){ public void run(){
+						encoding = enc; content = decoded;
+						tv.setText(decoded, TextView.BufferType.SPANNABLE);
+						int lc=1; for(int i=0;i<decoded.length();i++) if(decoded.charAt(i)=='\n') lc++;
+						lineNums.setTotalLines(lc); hitSpans.clear(); hits.clear(); cur=-1;
+						if(searchBar.getVisibility()==View.VISIBLE) updateHits(false);
+						activity.toast("Encoding: " + enc);
+					}});
+				} } catch(Exception e){ activity.uiPost(new Runnable(){public void run(){activity.toast("Can't decode using " + enc);}}); }
+			}}).start();
 		}
 
 		void setWrap(boolean w) {
@@ -1818,6 +1986,16 @@ class PreviewManager {
 				suspicious++;
 		}
 		return suspicious * 100 / len > 5;
+	}
+
+	byte[] readPrefixBytes(File f, int max) throws IOException {
+		FileInputStream in = new FileInputStream(f);
+		try {
+			ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(max, 65536));
+			byte[] buf = new byte[8192]; int total=0, n;
+			while(total < max && (n=in.read(buf,0,Math.min(buf.length,max-total)))>0){ out.write(buf,0,n); total+=n; }
+			return out.toByteArray();
+		} finally { in.close(); }
 	}
 
 	byte[] readAllBytes(File f) throws IOException {
