@@ -17,6 +17,7 @@ import android.widget.TextView;
 public class LineNumberView extends TextView {
 	private PreviewTextView target;
 	private int colorNormal = 0xFF888888;
+	private int colorCurrent = 0xFF7B1FA2;
 	private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
 	private final char[] buf = new char[4096];
 	private int anchorOff = 0, anchorNl = 0;
@@ -51,6 +52,11 @@ public class LineNumberView extends TextView {
 
 	public void setNumberColor(int c) {
 		colorNormal = c;
+	}
+
+	/** colour (drawn bold) of the number of the line that holds the cursor */
+	public void setCurrentColor(int c) {
+		colorCurrent = c;
 	}
 
 	/** Counts lines once for the loaded text and sizes the gutter to fit the widest number. */
@@ -100,10 +106,22 @@ public class LineNumberView extends TextView {
 		anchorOff = ls;
 		anchorNl = nl;
 
+		// visual row where the logical line of the cursor begins
+		int sel = target.getSelectionStart();
+		int curStartRow = -1;
+		if (sel >= 0 && sel <= textLen) {
+			int cv = l.getLineForOffset(sel);
+			while (cv > 0) {
+				int s = l.getLineStart(cv);
+				if (s <= 0 || s > textLen || text.charAt(s - 1) == '\n') break;
+				cv--;
+			}
+			curStartRow = cv;
+		}
+
 		paint.setTypeface(getTypeface());
 		paint.setTextSize(getTextSize());
 		paint.setTextAlign(Paint.Align.RIGHT);
-		paint.setColor(colorNormal);
 		float x = getWidth() - getPaddingRight();
 		int cur = nl + 1;
 		for (int v = first; v <= last; v++) {
@@ -111,6 +129,9 @@ public class LineNumberView extends TextView {
 			boolean start = s <= 0 || (s <= textLen && text.charAt(s - 1) == '\n');
 			if (v > first && start) cur++;
 			if (!start) continue;
+			boolean isCur = v == curStartRow;
+			paint.setColor(isCur ? colorCurrent : colorNormal);
+			paint.setFakeBoldText(isCur);
 			canvas.drawText(String.valueOf(cur), x, padTop + l.getLineBaseline(v) - scrollY, paint);
 		}
 	}
