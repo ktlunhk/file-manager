@@ -515,6 +515,7 @@ class ZipItem extends File {
         android.widget.FrameLayout box = new android.widget.FrameLayout(a);
         a.padDialogBox(box);
         box.addView(pw, new android.widget.FrameLayout.LayoutParams(-1, -2));
+        a.themeDialogView(box);
         a.createDialog("Password required", cf.getName() + (wrong ? "\nWrong password, try again." : "")).setView(box)
             .setPositiveButton("Open", new android.content.DialogInterface.OnClickListener() {
                 public void onClick(android.content.DialogInterface d, int w) {
