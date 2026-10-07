@@ -73,7 +73,7 @@ public class MainActivity extends Activity {
 	boolean advSearchRecursive = true, advSearchCase = false;
 	int advSearchKind = 0; // 0 all, 1 files, 2 folders
 	String advSearchExt = "";
-	long advSearchMin = -1, advSearchMax = -1, advSearchAfter = -1; 
+	long advSearchMin = -1, advSearchMax = -1, advSearchAfter = -1, advSearchDays = -1; 
 	int dp;
 	ArrayList<String> bookmarks = new ArrayList<String>();
 	static final String TRASH_NAME = ".trash";
@@ -125,7 +125,18 @@ public class MainActivity extends Activity {
 		if (view instanceof TextView) {
 			TextView tv = (TextView) view;
 			tv.setTextColor(colText);
-			if (tv instanceof EditText) ((EditText) tv).setHintTextColor(colTextMuted);
+			if (tv instanceof EditText) {
+				((EditText) tv).setHintTextColor(colTextMuted);
+				if (android.os.Build.VERSION.SDK_INT >= 21)
+					tv.setBackgroundTintList(android.content.res.ColorStateList.valueOf(dark ? 0xFFB0B0B0 : 0xFF666666));
+			}
+		}
+		if (view instanceof android.widget.CompoundButton && android.os.Build.VERSION.SDK_INT >= 21) {
+			int normal = dark ? 0xFFBDBDBD : 0xFF616161;
+			int checked = dark ? 0xFF80CBC4 : 0xFF00796B;
+			int[][] states = new int[][] { new int[] { android.R.attr.state_checked }, new int[] {} };
+			int[] colors = new int[] { checked, normal };
+			((android.widget.CompoundButton) view).setButtonTintList(new android.content.res.ColorStateList(states, colors));
 		}
 		if (view instanceof ViewGroup) {
 			ViewGroup group = (ViewGroup) view;
@@ -252,6 +263,14 @@ public class MainActivity extends Activity {
 		showHidden = prefs.getBoolean("showHidden", false);
 		showMega = prefs.getBoolean("showMega", false);
 		themeMode = prefs.getInt("themeMode", THEME_SYSTEM);
+		advSearchKind = prefs.getInt("advSearchKind", 0);
+		advSearchExt = prefs.getString("advSearchExt", "");
+		advSearchMin = prefs.getLong("advSearchMin", -1);
+		advSearchMax = prefs.getLong("advSearchMax", -1);
+		advSearchDays = prefs.getLong("advSearchDays", -1);
+		advSearchAfter = advSearchDays >= 0 ? System.currentTimeMillis() - advSearchDays * 86400000L : -1;
+		advSearchRecursive = prefs.getBoolean("advSearchRecursive", true);
+		advSearchCase = prefs.getBoolean("advSearchCase", false);
 		File lc = new File(prefs.getString("leftCur", ""));
 		File rc = new File(prefs.getString("rightCur", ""));
 		if (lc.getPath().length() > 0 && lc.isDirectory()) leftCur = lc;
@@ -288,6 +307,13 @@ public class MainActivity extends Activity {
 		e.putBoolean("showHidden", showHidden);
 		e.putBoolean("showMega", showMega);
 		e.putInt("themeMode", themeMode);
+		e.putInt("advSearchKind", advSearchKind);
+		e.putString("advSearchExt", advSearchExt);
+		e.putLong("advSearchMin", advSearchMin);
+		e.putLong("advSearchMax", advSearchMax);
+		e.putLong("advSearchDays", advSearchDays);
+		e.putBoolean("advSearchRecursive", advSearchRecursive);
+		e.putBoolean("advSearchCase", advSearchCase);
 		if (leftTreeScroll != null) leftScrollY = leftTreeScroll.getScrollY();
 		if (rightTreeScroll != null) rightScrollY = rightTreeScroll.getScrollY();
 		e.putInt("leftScrollY", Math.max(0, leftScrollY));
@@ -1676,22 +1702,40 @@ public class MainActivity extends Activity {
 		return hit || childHit;
 	}
 
+	String formatSearchMb(long bytes) {
+		double mb = bytes / (1024.0 * 1024.0);
+		if (Math.abs(mb - Math.rint(mb)) < 0.000001) return String.valueOf((long)Math.rint(mb));
+		String v = String.format(Locale.US, "%.3f", mb);
+		while (v.endsWith("0")) v = v.substring(0, v.length()-1);
+		if (v.endsWith(".")) v = v.substring(0, v.length()-1);
+		return v;
+	}
+
 	void showAdvancedSearchOptions() {
-		final LinearLayout box=new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(16*dp,8*dp,16*dp,4*dp); themeDialogView(box);
-		final Spinner kind=new Spinner(this); kind.setAdapter(new ArrayAdapter<String>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"Files and folders","Files only","Folders only"})); kind.setSelection(advSearchKind); box.addView(kind);
-		final EditText ext=new EditText(this); ext.setHint("Extension, e.g. pdf (optional)"); ext.setSingleLine(true); ext.setText(advSearchExt); box.addView(ext);
-		final EditText min=new EditText(this); min.setHint("Minimum size MB (optional)"); min.setInputType(2|8192); box.addView(min);
-		final EditText max=new EditText(this); max.setHint("Maximum size MB (optional)"); max.setInputType(2|8192); box.addView(max);
-		final EditText days=new EditText(this); days.setHint("Modified within days (optional)"); days.setInputType(2); box.addView(days);
-		final CheckBox rec=new CheckBox(this); rec.setText("Search subfolders / archive entries"); rec.setChecked(advSearchRecursive); box.addView(rec);
-		final CheckBox cs=new CheckBox(this); cs.setText("Case sensitive"); cs.setChecked(advSearchCase); box.addView(cs);
-		createDialog("Advanced search filters", null).setView(box).setPositiveButton("Apply", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){
+		final AlertDialog.Builder builder = createDialog("Advanced search filters", null);
+		android.content.Context cx = builder.getContext();
+		final LinearLayout box=new LinearLayout(cx); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(16*dp,8*dp,16*dp,4*dp);
+		final Spinner kind=new Spinner(cx);
+		final String[] kinds=new String[]{"Files and folders","Files only","Folders only"};
+		ArrayAdapter<String> kindAdapter=new ArrayAdapter<String>(cx, android.R.layout.simple_spinner_item, kinds) {
+			public View getView(int pos, View convert, ViewGroup parent) { View v=super.getView(pos,convert,parent); themeDialogView(v); return v; }
+			public View getDropDownView(int pos, View convert, ViewGroup parent) { View v=super.getDropDownView(pos,convert,parent); themeDialogView(v); if(dark)v.setBackgroundColor(0xFF424242); return v; }
+		};
+		kindAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); kind.setAdapter(kindAdapter); kind.setSelection(advSearchKind); box.addView(kind);
+		final EditText ext=new EditText(cx); ext.setHint("Extension, e.g. pdf (optional)"); ext.setSingleLine(true); ext.setText(advSearchExt); box.addView(ext);
+		final EditText min=new EditText(cx); min.setHint("Minimum size MB (optional)"); min.setInputType(2|8192); if(advSearchMin>=0) min.setText(formatSearchMb(advSearchMin)); box.addView(min);
+		final EditText max=new EditText(cx); max.setHint("Maximum size MB (optional)"); max.setInputType(2|8192); if(advSearchMax>=0) max.setText(formatSearchMb(advSearchMax)); box.addView(max);
+		final EditText days=new EditText(cx); days.setHint("Modified within days (optional)"); days.setInputType(2); if(advSearchDays>=0) days.setText(String.valueOf(advSearchDays)); box.addView(days);
+		final CheckBox rec=new CheckBox(cx); rec.setText("Search subfolders / archive entries"); rec.setChecked(advSearchRecursive); box.addView(rec);
+		final CheckBox cs=new CheckBox(cx); cs.setText("Case sensitive"); cs.setChecked(advSearchCase); box.addView(cs);
+		themeDialogView(box);
+		builder.setView(box).setPositiveButton("Apply", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){
 			advSearchKind=kind.getSelectedItemPosition(); advSearchExt=ext.getText().toString().trim().toLowerCase(Locale.US); if(advSearchExt.startsWith("."))advSearchExt=advSearchExt.substring(1);
 			try{advSearchMin=min.getText().length()==0?-1:(long)(Double.parseDouble(min.getText().toString())*1024*1024);}catch(Exception e){advSearchMin=-1;}
 			try{advSearchMax=max.getText().length()==0?-1:(long)(Double.parseDouble(max.getText().toString())*1024*1024);}catch(Exception e){advSearchMax=-1;}
-			try{long n=Long.parseLong(days.getText().toString()); advSearchAfter=System.currentTimeMillis()-n*86400000L;}catch(Exception e){advSearchAfter=-1;}
-			advSearchRecursive=rec.isChecked(); advSearchCase=cs.isChecked(); updateSearchScopeLabel();
-		}}).setNeutralButton("Reset", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){advSearchKind=0;advSearchExt="";advSearchMin=-1;advSearchMax=-1;advSearchAfter=-1;advSearchRecursive=true;advSearchCase=false;}}).setNegativeButton("Cancel",null).show();
+			try{advSearchDays=days.getText().length()==0?-1:Long.parseLong(days.getText().toString()); advSearchAfter=advSearchDays>=0?System.currentTimeMillis()-advSearchDays*86400000L:-1;}catch(Exception e){advSearchDays=-1;advSearchAfter=-1;}
+			advSearchRecursive=rec.isChecked(); advSearchCase=cs.isChecked(); saveState(); updateSearchScopeLabel();
+		}}).setNeutralButton("Reset", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){advSearchKind=0;advSearchExt="";advSearchMin=-1;advSearchMax=-1;advSearchAfter=-1;advSearchDays=-1;advSearchRecursive=true;advSearchCase=false;saveState();}}).setNegativeButton("Cancel",null).show();
 	}
 
 	boolean isBookmarked(File f) {
@@ -3533,9 +3577,8 @@ public class MainActivity extends Activity {
 			PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
 			if (pi.versionName != null && pi.versionName.length() > 0) version = pi.versionName;
 		} catch (Exception e) { }
-		new AlertDialog.Builder(this)
-			.setTitle("myFiles")
-			.setMessage("Version " + version + "\n\nAIDE Java build\nNo AndroidX")
+		createDialog("myFiles", null)
+			.setMessage("Version " + version)
 			.setPositiveButton("OK", null)
 			.show();
 	}
