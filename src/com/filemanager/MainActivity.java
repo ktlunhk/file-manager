@@ -1226,17 +1226,36 @@ public class MainActivity extends Activity {
 	void showCompareResults(final File l, final File r, final ArrayList<CompareItem> all) {
 		int[] c = new int[7];
 		for (int i = 0; i < all.size(); i++) c[all.get(i).status]++;
-		LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(16*dp, 8*dp, 16*dp, 8*dp);
-		TextView summary = new TextView(this); summary.setTextColor(colText); summary.setTextSize(13);
+		LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(26*dp, 8*dp, 16*dp, 8*dp); // match the actual rendered title start
+		TextView summary = new TextView(this); summary.setTextColor(colText); summary.setTextSize(13); summary.setPadding(0, 0, 0, 0);
 		summary.setText("Left: " + l.getAbsolutePath() + "\nRight: " + r.getAbsolutePath() + "\n\n" +
 				"Same " + c[CMP_SAME] + "   Left only " + c[CMP_LEFT_ONLY] + "   Right only " + c[CMP_RIGHT_ONLY] + "\n" +
 				"Left newer " + c[CMP_LEFT_NEWER] + "   Right newer " + c[CMP_RIGHT_NEWER] + "   Different " + c[CMP_DIFFERENT] +
 				"   Conflicts " + c[CMP_TYPE_CONFLICT]);
 		root.addView(summary, new LinearLayout.LayoutParams(-1, -2));
-		final CheckBox same = new CheckBox(this); same.setText("Show SAME items"); same.setTextColor(colText); root.addView(same);
+		final CheckBox same = new CheckBox(this); 
+		same.setText("Show SAME items"); 
+		same.setTextColor(colText);
+		same.setButtonTintList(
+			android.content.res.ColorStateList.valueOf(colText)
+		);
+        same.setTranslationX(-9 * dp);
+        root.setClipChildren(true);
+        root.setClipToPadding(true);
+        LinearLayout.LayoutParams sameLp = new LinearLayout.LayoutParams(-1, -2);
+        root.addView(same, sameLp);
 		final LinearLayout rows = new LinearLayout(this); rows.setOrientation(LinearLayout.VERTICAL);
-		ScrollView sv = new ScrollView(this); sv.addView(rows); root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1));
-		final AlertDialog dlg = createDialog("Compare folders", null).setView(root).setPositiveButton("Close", null).create();
+		ScrollView sv = new ScrollView(this);
+        sv.setClipChildren(true);
+        sv.setClipToPadding(true);
+        rows.setClipChildren(true);
+        sv.addView(rows);
+        root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1));
+		final AlertDialog dlg = createDialog("Compare folders", null).setPositiveButton("Close", null).create();
+        // setView(view) applies an additional theme-dependent inset on some
+        // Android versions. Explicit zero spacing keeps the root's own 16dp
+        // padding aligned with the fixed 16dp popup title padding.
+        dlg.setView(root, 0, 0, 0, 0);
 		final Runnable rebuild = new Runnable() { public void run() { buildCompareRows(rows, all, same.isChecked(), dlg); } };
 		same.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() { public void onCheckedChanged(CompoundButton b, boolean v) { rebuild.run(); } });
 		rebuild.run(); dlg.show();
@@ -1247,7 +1266,7 @@ public class MainActivity extends Activity {
 		for (int i = 0; i < all.size(); i++) {
 			final CompareItem ci = all.get(i);
 			if (!showSame && ci.status == CMP_SAME) continue;
-			LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(4*dp, 7*dp, 4*dp, 7*dp);
+			LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(0, 7*dp, 4*dp, 7*dp);
 			TextView t = new TextView(this); t.setTextColor(colText); t.setTextSize(13); t.setText(ci.name + "\n" + compareStatus(ci.status)); row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
 			if (ci.left != null && ci.status != CMP_SAME) {
 				Button b = new Button(this); b.setText("\u2192"); b.setContentDescription("Copy left to right"); b.setOnClickListener(new View.OnClickListener() { public void onClick(View v) { compareCopy(ci, true, dlg); } }); row.addView(b, new LinearLayout.LayoutParams(54*dp, -2));
@@ -3834,7 +3853,7 @@ public class MainActivity extends Activity {
 					row = new LinearLayout(MainActivity.this);
 					row.setOrientation(LinearLayout.HORIZONTAL);
 					row.setGravity(Gravity.CENTER_VERTICAL);
-					row.setPadding(20 * dp, 14 * dp, 20 * dp, 14 * dp);
+					row.setPadding(24 * dp, 14 * dp, 20 * dp, 14 * dp); // match native title inset
 					icon = new TextView(MainActivity.this);
 					icon.setTextSize(17);
 					icon.setGravity(Gravity.CENTER);
@@ -4920,8 +4939,8 @@ public class MainActivity extends Activity {
 	}
 
 	String digestFile(File f, String alg) throws Exception {
-		MessageDigest md=MessageDigest.getInstance(alg); InputStream in=new FileInputStream(f);
-		try { byte[] b=new byte[65536]; int n; while((n=in.read(b))>0) md.update(b,0,n); } finally { in.close(); }
+		MessageDigest md=MessageDigest.getInstance(alg); InputStream in=new java.io.BufferedInputStream(new FileInputStream(f), 131072);
+		try { byte[] b=new byte[131072]; int n; while((n=in.read(b))>0) md.update(b,0,n); } finally { in.close(); }
 		byte[] d=md.digest(); StringBuilder x=new StringBuilder(); for(int i=0;i<d.length;i++){ String h=Integer.toHexString(d[i]&255); if(h.length()<2)x.append('0'); x.append(h); } return x.toString();
 	}
 
@@ -4938,7 +4957,7 @@ public class MainActivity extends Activity {
 
 	void showStorageAnalyzer(final File root) {
 		if (root == null || !root.isDirectory() || root instanceof MegaItem || root instanceof ZipItem) { toast("Select a local folder"); return; }
-		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*20,dp*14,dp*20,dp*14); progress.setText("Scanning..."); themeDialogView(progress);
+		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*16,dp*14,dp*20,dp*14); progress.setText("Scanning..."); themeDialogView(progress);
 		final AlertDialog scan=createDialog("Storage analyzer", null).setView(progress).setNegativeButton("Cancel", new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){cancel[0]=true;}}).create(); scan.show();
 		new Thread(new Runnable(){ public void run(){
 			final long[] t=new long[4]; final long[] cat=new long[7]; final String[] cn={"Images","Video","Audio","Documents","APK","Archives","Other"};
@@ -4953,7 +4972,7 @@ public class MainActivity extends Activity {
 
 	void showDuplicateFinder(final File root) {
 		if(root==null||!root.isDirectory()||root instanceof MegaItem||root instanceof ZipItem){toast("Select a local folder");return;}
-		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*20,dp*14,dp*20,dp*14); progress.setText("Scanning file sizes..."); themeDialogView(progress);
+		final boolean[] cancel={false}; final TextView progress=new TextView(this); progress.setPadding(dp*16,dp*14,dp*20,dp*14); progress.setText("Scanning file sizes..."); themeDialogView(progress);
 		final AlertDialog scan=createDialog("Duplicate finder",null).setView(progress).setNegativeButton("Cancel",new DialogInterface.OnClickListener(){public void onClick(DialogInterface d,int w){cancel[0]=true;}}).create(); scan.show();
 		new Thread(new Runnable(){public void run(){
 			HashMap<Long,ArrayList<File> > sizes=new HashMap<Long,ArrayList<File> >(); ArrayList<File> stack=new ArrayList<File>(); stack.add(root); long files=0;
