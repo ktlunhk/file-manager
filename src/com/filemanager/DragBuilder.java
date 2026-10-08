@@ -7,16 +7,47 @@ import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewParent;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.ListAdapter;
 import android.widget.ListView;
+import android.widget.TextView;
+import android.util.TypedValue;
+import android.graphics.Color;
 
 /** AlertDialog.Builder whose dialogs can be moved by dragging them (title, message or any empty area). */
 class DragBuilder extends AlertDialog.Builder {
-	DragBuilder(Context c, int theme) {
-		super(c, theme);
-	}
+    private final boolean popupDark;
+    DragBuilder(Context c, int theme) {
+        super(c, theme);
+        // MainActivity supplies the selected light/dark dialog theme explicitly.
+        popupDark = theme == android.R.style.Theme_Material_Dialog_Alert;
+    }
+
+    // Use a fixed title inset at creation time. Do not translate the title
+    // or modify its padding after show: those approaches cause visual jumps.
+    @Override
+    public AlertDialog.Builder setTitle(CharSequence title) {
+        if (title == null) return super.setTitle((CharSequence) null);
+        Context context = getContext();
+        float density = context.getResources().getDisplayMetrics().density;
+        TextView header = new TextView(context);
+        header.setText(title);
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        // Resolve the color from the app-selected popup theme, not the
+        // Activity theme (which can retain a pink system accent).
+        header.setTextColor(popupDark ? Color.WHITE : Color.BLACK);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding((int)(16*density), (int)(20*density),
+                          (int)(24*density), (int)(12*density));
+        return super.setCustomTitle(header);
+    }
+
+    @Override
+    public AlertDialog.Builder setTitle(int titleId) {
+        return setTitle(getContext().getText(titleId));
+    }
 
 	public AlertDialog create() {
 		AlertDialog d = super.create();
@@ -34,6 +65,18 @@ class DragBuilder extends AlertDialog.Builder {
 			return;
 		w.setGravity(Gravity.CENTER);
 		shrinkMenu(d, w);
+        // Align standard message dialogs (checksums, duplicate finder results,
+        // storage analyzer results) with the 16dp custom-title inset.
+        // Do not translate views or modify the header after opening.
+        TextView messageView = (TextView) w.getDecorView().findViewById(android.R.id.message);
+        if (messageView != null) {
+            int inset = (int)(16 * d.getContext().getResources().getDisplayMetrics().density);
+            messageView.setPadding(inset, messageView.getPaddingTop(),
+                                   messageView.getPaddingRight(), messageView.getPaddingBottom());
+        }
+        // Keep the platform title's original position. Changing its padding
+        // after show caused a visible jump in long-press menus and occasionally
+        // clipped the first character on some Android themes.
 		View content = w.getDecorView().findViewById(android.R.id.content);
 		if (content == null)
 			content = w.getDecorView();
@@ -72,6 +115,7 @@ class DragBuilder extends AlertDialog.Builder {
 			}
 		});
 	}
+
 
 	/** menu dialogs (list of items): fit the width to the title and the widest item instead of the fixed wide dialog */
 	static void shrinkMenu(AlertDialog d, Window w) {
