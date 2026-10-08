@@ -471,6 +471,7 @@ class FileOperations {
 				if (!d.exists() && !d.mkdirs())
 					throw new IOException("Cannot create folder " + d.getName());
 				File[] c = s.listFiles();
+                if (c == null) throw new IOException("Cannot read source folder " + s.getName());
 				if (c != null)
 					for (int i = 0; i < c.length; i++)
 						copyNode(c[i], new File(d, c[i].getName()));
@@ -499,6 +500,8 @@ class FileOperations {
 				if (decision == 4) d = uniqueInDir(d.getParentFile(), d.getName());
 				else over = true;
 			}
+            if (!(s instanceof ZipItem) && !(s instanceof MegaItem) && activity.isSymlink(s))
+                throw new IOException("Copying symbolic links is not supported: " + s.getName());
 			cur = s.getName();
 			tick(true);
 			copyData(s, d, over);
@@ -534,9 +537,10 @@ class FileOperations {
 					if (ze == null) throw new IOException("Entry not found: " + zi.entry);
 					in = zf.getInputStream(ze);
 				} else if (s instanceof MegaItem) in = ((MegaItem) s).openStream();
-				else in = new FileInputStream(s);
-				out = new BufferedOutputStream(new FileOutputStream(target));
-				byte[] buf = new byte[65536];
+				else in = new BufferedInputStream(new FileInputStream(s), 131072);
+				FileOutputStream fileOut = new FileOutputStream(target);
+				out = new BufferedOutputStream(fileOut);
+				byte[] buf = new byte[131072];
 				int n;
 				while ((n = in.read(buf)) > 0) {
 					if (cancelled) throw new InterruptedIOException("Cancelled");
@@ -545,11 +549,13 @@ class FileOperations {
 					tick(false);
 				}
 				out.flush();
+                fileOut.getFD().sync(); // commit temporary data before publishing destination
 				out.close(); out = null;
 				if (!(s instanceof ZipItem) && !(s instanceof MegaItem) && target.length() != s.length())
 					throw new IOException("Copy verification failed for " + s.getName());
 
 				File backup = null;
+                if (d.exists() && !over) throw new IOException("Destination appeared during copy: " + d.getName());
 				if (d.exists()) {
 					backup = new File(parent, d.getName() + ".dfm-old");
 					int oldNo = 2;
