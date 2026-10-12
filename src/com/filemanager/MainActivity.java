@@ -4773,9 +4773,53 @@ public class MainActivity extends Activity {
 						return true;
 			return false;
 		}
-		File x = new File(parent, n);
-		return x.exists() && (self == null || !x.equals(self));
+        // Exclude the original entry by its full path, not by the spelling
+        // of the proposed new name. Case-only renames must be permitted.
+        File[] siblings = parent.listFiles();
+        if (siblings != null) {
+            for (File child : siblings) {
+                if (!child.getName().equalsIgnoreCase(n)) continue;
+                if (self != null && child.getAbsolutePath().equals(self.getAbsolutePath())) continue;
+                return true;
+            }
+            return false;
+        }
+        File x = new File(parent, n);
+        if (self != null && n.equalsIgnoreCase(self.getName())) return false;
+        return x.exists();
 	}
+
+    /** Rename a local file, using a temporary sibling for case-only changes.
+     * Android emulated storage can resolve both casings to the same file, so
+     * checking target.exists() or canonical path equality is not sufficient.
+     */
+    boolean renameLocalSafely(File source, File target) {
+        String oldName = source.getName();
+        String newName = target.getName();
+        if (oldName.equals(newName)) return true;
+        File parent = source.getParentFile();
+        if (parent == null || !source.exists()) return false;
+        if (nameTaken(parent, newName, source)) return false;
+        boolean caseOnly = oldName.equalsIgnoreCase(newName);
+        if (!caseOnly) {
+            if (target.exists()) return false;
+            return source.renameTo(target);
+        }
+        // Always use the two-step rename for case-only changes, even when
+        // target.exists() is false. Never overwrite a different sibling.
+        File temporary = null;
+        for (int i = 0; i < 100; i++) {
+            File candidate = new File(parent, ".myfiles_case_" +
+                    System.nanoTime() + "_" + i);
+            if (!candidate.exists()) { temporary = candidate; break; }
+        }
+        if (temporary == null || !source.renameTo(temporary)) return false;
+        if (!nameTaken(parent, newName, null) && temporary.renameTo(target))
+            return true;
+        if (!temporary.renameTo(source))
+            android.util.Log.e("myFiles", "Case rename rollback failed: " + temporary);
+        return false;
+    }
 
 	void ask(String title, String hint, final int a) {
 		AlertDialog.Builder dialogBuilder = createDialog(title, null);
@@ -4784,7 +4828,8 @@ public class MainActivity extends Activity {
 		e.setHint(hint);
 		e.setSingleLine(true);
 		themeDialogView(e);
-		final String original = a == 3 && selected != null ? selected.getName() : "";
+		final File renameSource = a == 3 ? selected : null;
+		final String original = renameSource != null ? renameSource.getName() : "";
 		if (a == 3 && selected != null)
 			e.setText(original);
 		// the input box with a red warning line under it
@@ -4802,7 +4847,7 @@ public class MainActivity extends Activity {
 		box.addView(warn, new LinearLayout.LayoutParams(-1, -2));
 		final File parentDir = a == 4 ? (selectedLeft ? leftCur : rightCur)
 				: (selected == null ? null : selected.getParentFile());
-		final File self = a == 3 ? selected : null;
+		final File self = renameSource;
 		final AlertDialog[] dlg = new AlertDialog[1];
 		e.addTextChangedListener(new android.text.TextWatcher() {
 			public void beforeTextChanged(CharSequence s, int st, int c, int af) {
@@ -4841,11 +4886,11 @@ public class MainActivity extends Activity {
 								toast(nf.mkdir() ? "Folder created" : "Create failed");
 							HashSet<String> op = selectedLeft ? leftOpen : rightOpen;
 							op.add(base.getAbsolutePath());
-						} else if (selected instanceof MegaItem) {
-							megaRename((MegaItem) selected, n);
+						} else if (renameSource instanceof MegaItem) {
+							megaRename((MegaItem) renameSource, n);
 							return;
-						} else if (selected instanceof ZipItem) {
-							ZipItem zi = (ZipItem) selected;
+						} else if (renameSource instanceof ZipItem) {
+							ZipItem zi = (ZipItem) renameSource;
 							if (n.indexOf('/') >= 0) {
 								toast("Invalid name");
 								return;
@@ -4854,10 +4899,12 @@ public class MainActivity extends Activity {
 							ZipItem.zipModify(MainActivity.this, zi.zip, zi.entry, n, "Renamed");
 							return;
 						} else {
-							File x = new File(selected.getParentFile(), n);
-							if (x.exists())
+							File source = renameSource;
+                            if (source == null) return;
+							File x = new File(source.getParentFile(), n);
+							if (nameTaken(source.getParentFile(), n, source))
 								toast("Already exists");
-							else if (selected.renameTo(x)) {
+							else if (renameLocalSafely(source, x)) {
 								markSelected(x, selectedLeft);
 								toast("Renamed");
 							} else
