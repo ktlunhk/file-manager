@@ -2342,9 +2342,42 @@ public class MainActivity extends Activity {
 				: (f instanceof DexItem ? dexIcon((DexItem) f)
 						: ((ZipItem.isZipLike(f) || isMegaArchive(f)) ? "📦" : (f.isDirectory() ? "📁" : fileTypeIcon(f.getName()))));
 		icon.setText(iconText);
-		icon.setTextSize(rootNode ? 22 : 18);
+        // Unknown file type: use a theme-aware question mark, not an emoji.
+        if (!rootNode && "?".equals(iconText)) {
+            icon.setTextColor(colText);
+            icon.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+            icon.setTextSize(25);
+        } else {
+            icon.setTextSize(rootNode ? 22 : 18);
+        }
 		int iconW = iconText.length() == 0 ? 0 : (rootNode ? 34 * dp : 26 * dp);
-		row.addView(icon, new LinearLayout.LayoutParams(iconW, -1));
+        // A single icon slot for every file type prevents differing icon sizes
+        // and keeps filename text aligned across folder, ZIP, APK and text rows.
+        final int fileIconSize = 36 * dp;
+        final int fileIconSlot = rootNode ? 34 * dp : 38 * dp;
+        boolean isApkIcon = !rootNode && apkIconKey(f) != null;
+        if (isApkIcon || (!rootNode && !(f instanceof DexItem)
+                && (ZipItem.isZipLike(f) || isMegaArchive(f) || f.isDirectory()))) {
+            ImageView fileIcon = new ImageView(this);
+            if (isApkIcon) {
+                // Show the existing package icon immediately, then replace it
+                // with the extracted app icon when the background task finishes.
+                fileIcon.setImageResource(R.drawable.ic_zip_xplore);
+                loadApkIconAsync(f, fileIcon);
+            } else {
+                boolean archiveIcon = ZipItem.isZipLike(f) || isMegaArchive(f);
+                fileIcon.setImageResource(archiveIcon
+                        ? R.drawable.ic_zip_xplore : R.drawable.ic_folder_xplore);
+            }
+            fileIcon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            fileIcon.setPadding(0, 0, 0, 0);
+            LinearLayout iconSlot = new LinearLayout(this);
+            iconSlot.setGravity(Gravity.CENTER);
+            iconSlot.addView(fileIcon, new LinearLayout.LayoutParams(fileIconSize, fileIconSize));
+            row.addView(iconSlot, new LinearLayout.LayoutParams(fileIconSlot, -1));
+        } else {
+            row.addView(icon, new LinearLayout.LayoutParams(fileIconSlot, -1));
+        }
 
 		if (!rootNode && f.isDirectory() && !(f instanceof ZipItem) && isBookmarked(f)) {
 			TextView star = new TextView(this);
@@ -2374,9 +2407,27 @@ public class MainActivity extends Activity {
 			sub.setText(((MegaItem) f).statusText());
 		else if (rootNode)
 			sub.setText(f.getAbsolutePath());
-		else
+		else if (f instanceof ZipItem && ZipItem.isZipRoot(f) && !expanded) {
+            // An APK is a ZIP archive. Counting its entries here used to open
+            // every APK synchronously while building the containing folder.
+            // Only enumerate entries when the user explicitly expands it.
+            sub.setText(human(((ZipItem) f).zip.length()));
+        } else
 			sub.setText(f.isDirectory() ? detail(f).trim()
 					: (expanded && isMegaArchive(f) ? "[" + filterHidden(children(f)).length + "]   " + human(f.length()) : human(f.length())));
+        // Show file modification time in the detail line without inspecting archives.
+        if (!rootNode && !f.isDirectory() && f.lastModified() > 0) {
+            String stamp = new java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.US)
+                    .format(new java.util.Date(f.lastModified()));
+            sub.setText(stamp + "   " + human(f.length()));
+        } else if (!rootNode && f instanceof ZipItem && ZipItem.isZipRoot(f)) {
+            File original = ((ZipItem) f).zip;
+            if (original.lastModified() > 0) {
+                String stamp = new java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.US)
+                        .format(new java.util.Date(original.lastModified()));
+                sub.setText(stamp + "   " + human(original.length()));
+            }
+        }
 		sub.setTextColor(colTextMuted);
 		sub.setTextSize(rootNode ? 11 : 10);
 		sub.setSingleLine(true);
@@ -2839,6 +2890,13 @@ public class MainActivity extends Activity {
 
 	String detail(File f) {
 		if (f.isDirectory()) {
+            // Archive roots are represented as directories, but reading their
+            // children here opens every APK/ZIP while the parent is drawn.
+            // Only count entries after the archive has actually been expanded.
+            if (f instanceof ZipItem && ZipItem.isZipRoot(f)) {
+                boolean open = leftOpen.contains(f.getAbsolutePath()) || rightOpen.contains(f.getAbsolutePath());
+                if (!open) return "   " + human(((ZipItem) f).zip.length());
+            }
 			File[] a = filterHidden(children(f));
 			String cnt = a == null ? "" : "   [" + a.length + "]";
 			if (ZipItem.isZipRoot(f))
@@ -2851,7 +2909,7 @@ public class MainActivity extends Activity {
 	String fileTypeIcon(String name) {
 		int dot = name.lastIndexOf('.');
 		if (dot < 0 || dot == name.length() - 1)
-			return "";
+			return "?";
 		String ext = name.substring(dot + 1).toLowerCase(Locale.US);
 		if (ext.matches("jpg|jpeg|png|gif|bmp|webp|heic|svg"))
 			return "\uD83D\uDDBC"; // 🖼
@@ -2869,7 +2927,7 @@ public class MainActivity extends Activity {
 			return "\uD83D\uDCC4"; // 📄
 		if (ext.matches("java|kt|py|js|ts|c|cpp|h|xml|json|gradle|html|css|sh|rs|go"))
 			return "\uD83D\uDCDD"; // 📝
-		return "";
+		return "?";
 	}
 
 	String dexIcon(DexItem d) {
@@ -3671,6 +3729,79 @@ public class MainActivity extends Activity {
         if (f.isDirectory()) return 0;
         if (ZipItem.isZipName(f.getName()) || isMegaArchive(f)) return 1;
         return 2;
+    }
+
+    // APK icon extraction is slow: never run it while expanding a tree node.
+    // Cache successful icons, remember failures, and limit background work.
+    final android.util.LruCache<String, android.graphics.drawable.Drawable.ConstantState>
+        apkIconCache = new android.util.LruCache<String, android.graphics.drawable.Drawable.ConstantState>(120);
+    final java.util.HashSet<String> apkIconMissing = new java.util.HashSet<String>();
+    final java.util.HashSet<String> apkIconPending = new java.util.HashSet<String>();
+    final java.util.concurrent.ExecutorService apkIconExecutor =
+        java.util.concurrent.Executors.newFixedThreadPool(2);
+    final android.os.Handler apkIconHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+
+    String apkIconKey(File file) {
+        File apk = file instanceof ZipItem ? ((ZipItem) file).zip : file;
+        if (apk == null || !apk.isFile() ||
+            !apk.getName().toLowerCase(java.util.Locale.US).endsWith(".apk")) return null;
+        return apk.getAbsolutePath() + ":" + apk.length() + ":" + apk.lastModified();
+    }
+
+    void loadApkIconAsync(final File file, final ImageView view) {
+        final String key = apkIconKey(file);
+        if (key == null) return;
+        view.setTag(key);
+        android.graphics.drawable.Drawable.ConstantState state = apkIconCache.get(key);
+        if (state != null) {
+            view.setImageDrawable(state.newDrawable(getResources()));
+            return;
+        }
+        synchronized (apkIconPending) {
+            if (apkIconMissing.contains(key)) return;
+            // Each visible row requests an icon; deduplicate disk parsing.
+            if (apkIconPending.contains(key)) {
+                apkIconHandler.postDelayed(new Runnable() {
+                    public void run() {
+                        if (key.equals(view.getTag())) loadApkIconAsync(file, view);
+                    }
+                }, 250);
+                return;
+            }
+            apkIconPending.add(key);
+        }
+        final java.lang.ref.WeakReference<ImageView> weak =
+            new java.lang.ref.WeakReference<ImageView>(view);
+        apkIconExecutor.execute(new Runnable() {
+            public void run() {
+                android.graphics.drawable.Drawable.ConstantState result = null;
+                try {
+                    File apk = file instanceof ZipItem ? ((ZipItem) file).zip : file;
+                    PackageManager pm = getPackageManager();
+                    PackageInfo info = pm.getPackageArchiveInfo(apk.getAbsolutePath(), 0);
+                    if (info != null && info.applicationInfo != null) {
+                        ApplicationInfo app = info.applicationInfo;
+                        app.sourceDir = apk.getAbsolutePath();
+                        app.publicSourceDir = apk.getAbsolutePath();
+                        android.graphics.drawable.Drawable icon = app.loadIcon(pm);
+                        if (icon != null) result = icon.getConstantState();
+                    }
+                } catch (Exception ignored) { }
+                final android.graphics.drawable.Drawable.ConstantState ready = result;
+                apkIconHandler.post(new Runnable() {
+                    public void run() {
+                        synchronized (apkIconPending) {
+                            apkIconPending.remove(key);
+                            if (ready == null) apkIconMissing.add(key);
+                            else apkIconCache.put(key, ready);
+                        }
+                        ImageView current = weak.get();
+                        if (ready != null && current != null && key.equals(current.getTag()))
+                            current.setImageDrawable(ready.newDrawable(getResources()));
+                    }
+                });
+            }
+        });
     }
 
 	Comparator<File> sortComparator(final boolean left) {
