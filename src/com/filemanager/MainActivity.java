@@ -2237,6 +2237,16 @@ public class MainActivity extends Activity {
 			return;
 		}
 		Arrays.sort(arr, sortComparator(left));
+        // Three stable groups for every sort direction: real folders,
+        // browsable archives, then regular files.
+        File[] grouped = new File[arr.length];
+        int next = 0;
+        for (int group = 0; group <= 2; group++) {
+            for (int i = 0; i < arr.length; i++) {
+                if (sortGroup(arr[i]) == group) grouped[next++] = arr[i];
+            }
+        }
+        arr = grouped;
 		int limit = Math.min(arr.length, 400);
 		for (int i = 0; i < limit; i++) {
 			ArrayList<Boolean> childFlags = new ArrayList<Boolean>(ancestorLast);
@@ -3654,13 +3664,22 @@ public class MainActivity extends Activity {
 		return dot < 0 || dot == n.length() - 1 ? "" : n.substring(dot + 1).toLowerCase(Locale.US);
 	}
 
+    // Archives are browsable, but should sort after real directories.
+    // 0 = real folder, 1 = archive, 2 = ordinary file.
+    int sortGroup(File f) {
+        if (f instanceof ZipItem && ZipItem.isZipRoot(f)) return 1;
+        if (f.isDirectory()) return 0;
+        if (ZipItem.isZipName(f.getName()) || isMegaArchive(f)) return 1;
+        return 2;
+    }
+
 	Comparator<File> sortComparator(final boolean left) {
 		final int mode = left ? leftSort : rightSort;
 		final boolean rev = left ? leftSortRev : rightSortRev;
 		return new Comparator<File>() {
 			public int compare(File a, File b) {
-				if (a.isDirectory() != b.isDirectory())
-					return a.isDirectory() ? -1 : 1;
+                int ga = sortGroup(a), gb = sortGroup(b);
+                if (ga != gb) return ga < gb ? -1 : 1;
 				int c;
 				if (mode == SORT_SIZE)
 					c = Long.valueOf(a.length()).compareTo(Long.valueOf(b.length()));
