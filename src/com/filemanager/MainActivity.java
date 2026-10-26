@@ -2206,7 +2206,7 @@ public class MainActivity extends Activity {
 
 	void addNode(LinearLayout host, ArrayList<LineSpec> specs, int[] yCursor, final File f, final boolean left,
 			final int level, boolean rootNode, ArrayList<Boolean> ancestorLast, boolean isLast) {
-		int rowH = rootNode ? 84 * dp : 48 * dp;
+		int rowH = rootNode ? 84 * dp : (mediaThumbRow(f) ? 96 * dp : 48 * dp);
 		HashSet<String> opened = left ? leftOpen : rightOpen;
 		boolean expanded = expandable(f) && opened.contains(f.getAbsolutePath());
 		if (f instanceof MegaItem && ((MegaItem) f).isRootNode() && !((MegaItem) f).isReady())
@@ -2344,6 +2344,8 @@ public class MainActivity extends Activity {
 		});
 		row.addView(exp, new LinearLayout.LayoutParams(16 * dp, -1));
 
+		final boolean media = !rootNode && mediaThumbRow(f);
+		ImageView thumbImg = null;
 		TextView icon = new TextView(this);
 		icon.setGravity(Gravity.CENTER);
 		String iconText = rootNode ? (f instanceof MegaItem ? "☁" : isRemovableVol(f) ? "💾" : "📱")
@@ -2383,6 +2385,28 @@ public class MainActivity extends Activity {
             iconSlot.setGravity(Gravity.CENTER);
             iconSlot.addView(fileIcon, new LinearLayout.LayoutParams(fileIconSize, fileIconSize));
             row.addView(iconSlot, new LinearLayout.LayoutParams(fileIconSlot, -1));
+        } else if (media) {
+            // image / video: a thumbnail box (the file type icon shows until the thumbnail is ready)
+            FrameLayout fr = new FrameLayout(this);
+            fr.setBackgroundColor(dark ? Color.rgb(45, 52, 56) : Color.rgb(184, 222, 222));
+            icon.setTextSize(22);
+            fr.addView(icon, new FrameLayout.LayoutParams(-1, -1));
+            thumbImg = new ImageView(this);
+            thumbImg.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            fr.addView(thumbImg, new FrameLayout.LayoutParams(-1, -1));
+            if (getPreviewManager().isVideoFile(f.getName())) {
+                TextView play = new TextView(this);
+                play.setText("\u25B6");
+                play.setTextSize(11);
+                play.setTextColor(Color.WHITE);
+                play.setShadowLayer(3 * dp, 0, 0, Color.BLACK);
+                play.setPadding(4 * dp, 0, 0, 2 * dp);
+                fr.addView(play, new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.LEFT));
+            }
+            LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(100 * dp, 84 * dp);
+            fl.leftMargin = 4 * dp;
+            fl.rightMargin = 6 * dp;
+            row.addView(fr, fl);
         } else {
             row.addView(icon, new LinearLayout.LayoutParams(fileIconSlot, -1));
         }
@@ -2406,9 +2430,12 @@ public class MainActivity extends Activity {
 		name.setTextSize(rootNode ? 14 : 13);
 		if (rootNode || f.isDirectory())
 			name.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
-		name.setSingleLine(true);
+		if (media) {
+			name.setMaxLines(3); // long camera / screenshot names wrap
+		} else
+			name.setSingleLine(true);
 		name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-		textBox.addView(name, new LinearLayout.LayoutParams(-1, 0, 1));
+		textBox.addView(name, new LinearLayout.LayoutParams(-1, 0, media ? 2 : 1));
 
 		TextView sub = new TextView(this);
 		if (rootNode && f instanceof MegaItem)
@@ -2441,6 +2468,8 @@ public class MainActivity extends Activity {
 		sub.setSingleLine(true);
 		sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
 		textBox.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
+		if (thumbImg != null)
+			loadThumbAsync(f, getPreviewManager().isVideoFile(f.getName()), thumbImg, icon, sub, sub.getText().toString());
 
 		View.OnClickListener click = new View.OnClickListener() {
 			public void onClick(View v) {
@@ -2466,6 +2495,8 @@ public class MainActivity extends Activity {
 		sub.setOnClickListener(click);
 		textBox.setOnClickListener(click);
 		icon.setOnClickListener(click);
+		if (thumbImg != null)
+			thumbImg.setOnClickListener(click);
 
 		View.OnLongClickListener lc = new View.OnLongClickListener() {
 			public boolean onLongClick(View v) {
@@ -2498,6 +2529,8 @@ public class MainActivity extends Activity {
 		row.setOnLongClickListener(lc);
 		exp.setOnLongClickListener(lc);
 		icon.setOnLongClickListener(lc);
+		if (thumbImg != null)
+			thumbImg.setOnLongClickListener(lc);
 		name.setOnLongClickListener(lc);
 		sub.setOnLongClickListener(lc);
 		textBox.setOnLongClickListener(lc);
@@ -3965,7 +3998,159 @@ public class MainActivity extends Activity {
         java.util.concurrent.Executors.newFixedThreadPool(2);
     final android.os.Handler apkIconHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 
+    // ---- image / video thumbnails in the tree rows
+    final android.util.LruCache<String, android.graphics.Bitmap> thumbCache =
+        new android.util.LruCache<String, android.graphics.Bitmap>(8 * 1024 * 1024) {
+            protected int sizeOf(String k, android.graphics.Bitmap b) {
+                return b.getByteCount();
+            }
+        };
+    final java.util.HashMap<String, String> thumbInfo = new java.util.HashMap<String, String>();
+    final java.util.concurrent.ExecutorService thumbExecutor =
+        java.util.concurrent.Executors.newFixedThreadPool(2);
+
+    /** a normal image or video file on the phone, or an image / video entry inside a zip (not MEGA items) */
+    boolean mediaThumbRow(File f) {
+        if (f == null)
+            return false;
+        boolean zipEntry = f instanceof ZipItem && !((ZipItem) f).isRoot() && !f.isDirectory();
+        if (!zipEntry && (f.getClass() != File.class || !f.isFile()))
+            return false;
+        PreviewManager pm = getPreviewManager();
+        String n = f.getName();
+        return pm.isImageFile(n) || pm.isVideoFile(n);
+    }
+
+    String durationText(long ms) {
+        long sec = ms / 1000;
+        long h = sec / 3600, m = (sec / 60) % 60, s = sec % 60;
+        return h > 0 ? h + ":" + (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s
+                : m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    android.graphics.Bitmap scaleThumb(android.graphics.Bitmap b, int max) {
+        if (b == null)
+            return null;
+        int big = Math.max(b.getWidth(), b.getHeight());
+        if (big <= max)
+            return b;
+        float k = max / (float) big;
+        return android.graphics.Bitmap.createScaledBitmap(b, Math.max(1, (int) (b.getWidth() * k)),
+                Math.max(1, (int) (b.getHeight() * k)), true);
+    }
+
+    void loadThumbAsync(final File f, final boolean video, final ImageView view, final TextView icon,
+            final TextView sub, final String baseSub) {
+        final String key = f.getAbsolutePath() + ":" + f.length() + ":" + f.lastModified();
+        view.setTag(key);
+        String known = thumbInfo.get(key);
+        if (known != null)
+            sub.setText(known + "   " + baseSub);
+        android.graphics.Bitmap cached = thumbCache.get(key);
+        if (cached != null) {
+            view.setImageBitmap(cached);
+            icon.setVisibility(View.GONE);
+            return;
+        }
+        thumbExecutor.execute(new Runnable() {
+            public void run() {
+                android.graphics.Bitmap bmp = null;
+                String inf = null;
+                String path = f.getAbsolutePath();
+                File tmpDir = null;
+                try {
+                    if (f instanceof ZipItem) {
+                        // a zip entry is extracted to a temporary file first (small enough ones only), removed afterwards
+                        long sz = f.length();
+                        if (sz <= 0 || sz > (video ? 60L : 30L) * 1024 * 1024)
+                            throw new java.io.IOException("too big");
+                        tmpDir = new File(getCacheDir(), "thumbsrc/" + System.nanoTime());
+                        tmpDir.mkdirs();
+                        File local = new File(tmpDir, f.getName());
+                        ZipItem.extract((ZipItem) f, local);
+                        path = local.getAbsolutePath();
+                    }
+                    if (video) {
+                        android.media.MediaMetadataRetriever mr = new android.media.MediaMetadataRetriever();
+                        try {
+                            mr.setDataSource(path);
+                            bmp = scaleThumb(mr.getFrameAtTime(0), 240);
+                            String w = mr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH);
+                            String h = mr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT);
+                            String rot = mr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+                            String dur = mr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION);
+                            if (w != null && h != null) {
+                                boolean swap = "90".equals(rot) || "270".equals(rot);
+                                inf = (swap ? h : w) + "x" + (swap ? w : h);
+                            }
+                            if (dur != null)
+                                inf = (inf == null ? "" : inf + "  ") + durationText(Long.parseLong(dur));
+                        } finally {
+                            mr.release();
+                        }
+                    } else {
+                        android.graphics.BitmapFactory.Options o = new android.graphics.BitmapFactory.Options();
+                        o.inJustDecodeBounds = true;
+                        android.graphics.BitmapFactory.decodeFile(path, o);
+                        int w = o.outWidth, h = o.outHeight;
+                        if (w > 0 && h > 0) {
+                            int ss = 1;
+                            while (Math.max(w, h) / (ss * 2) >= 240)
+                                ss *= 2;
+                            android.graphics.BitmapFactory.Options o2 = new android.graphics.BitmapFactory.Options();
+                            o2.inSampleSize = ss;
+                            bmp = android.graphics.BitmapFactory.decodeFile(path, o2);
+                            int deg = 0;
+                            try {
+                                int ori = new android.media.ExifInterface(path).getAttributeInt(
+                                        android.media.ExifInterface.TAG_ORIENTATION, 1);
+                                if (ori == 6) deg = 90;
+                                else if (ori == 3) deg = 180;
+                                else if (ori == 8) deg = 270;
+                            } catch (Exception ignored) { }
+                            if (deg != 0 && bmp != null) {
+                                android.graphics.Matrix m = new android.graphics.Matrix();
+                                m.postRotate(deg);
+                                bmp = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+                            }
+                            inf = (deg == 90 || deg == 270) ? h + "x" + w : w + "x" + h;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (tmpDir != null) {
+                        File[] tf = tmpDir.listFiles();
+                        if (tf != null)
+                            for (int i = 0; i < tf.length; i++)
+                                tf[i].delete();
+                        tmpDir.delete();
+                    }
+                }
+                final android.graphics.Bitmap fb = bmp;
+                final String fi = inf;
+                apkIconHandler.post(new Runnable() {
+                    public void run() {
+                        if (fb != null)
+                            thumbCache.put(key, fb);
+                        if (fi != null)
+                            thumbInfo.put(key, fi);
+                        if (!key.equals(view.getTag()))
+                            return;
+                        if (fb != null) {
+                            view.setImageBitmap(fb);
+                            icon.setVisibility(View.GONE);
+                        }
+                        if (fi != null)
+                            sub.setText(fi + "   " + baseSub);
+                    }
+                });
+            }
+        });
+    }
+
     String apkIconKey(File file) {
+        // only the apk itself gets the app icon; the folders and files inside it use the normal icons
+        if (file instanceof ZipItem && !((ZipItem) file).isRoot()) return null;
         File apk = file instanceof ZipItem ? ((ZipItem) file).zip : file;
         if (apk == null || !apk.isFile() ||
             !apk.getName().toLowerCase(java.util.Locale.US).endsWith(".apk")) return null;
