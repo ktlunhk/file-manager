@@ -79,6 +79,12 @@ public class MainActivity extends Activity {
 	static final String TRASH_NAME = ".trash";
 	LinearLayout undoBar;
 	TextView undoText;
+	// clipboard bar: "Copy to clipboard" -> tap a destination folder in the tree -> PASTE
+	LinearLayout clipBar;
+	TextView clipSrcText, clipDestText, clipModeBox;
+	ArrayList<File> clipFiles = new ArrayList<File>();
+	File clipDest;
+	boolean clipMove;
 	Handler mainHandler = new Handler(Looper.getMainLooper());
 	Runnable hideUndo;
 	ArrayList<File[]> lastTrashBatch; 
@@ -743,6 +749,7 @@ public class MainActivity extends Activity {
 		status.setTextColor(colTextMuted);
 		status.setPadding(8 * dp, 4 * dp, 8 * dp, 4 * dp);
 		root.addView(status, new LinearLayout.LayoutParams(-1, 38 * dp));
+		clipBar = null; // built on first use (see updateClipBar)
 		mainRoot = root;
 		setContentView(root);
 
@@ -917,6 +924,7 @@ public class MainActivity extends Activity {
 						a = a.getParentFile();
 					}
 					markSelected(dir, left);
+					pickClipDest(dir);
 					refreshPane(left);
 				}
 			});
@@ -2441,6 +2449,7 @@ public class MainActivity extends Activity {
 					row.setBackgroundColor(colSelectedRow);
 				}
 				markSelected(f, left);
+				pickClipDest(f);
 				if (f.isDirectory() || isMegaArchive(f))
 					toggleFolder(f, left);
 				else {
@@ -3205,13 +3214,15 @@ public class MainActivity extends Activity {
 	}
 
 	void transferMulti(boolean move) {
-		ArrayList<File> srcs = multiItems();
+		transferItems(multiItems(), multiLeft ? rightCur : leftCur, move);
+	}
+
+	/** copy or move srcs into the folder dstDir (used by the other-pane Copy/Move and by the clipboard PASTE) */
+	void transferItems(ArrayList<File> srcs, File dstDir, boolean move) {
 		if (srcs.isEmpty()) {
 			toast("Nothing to " + (move ? "move" : "copy"));
 			return;
 		}
-		
-		File dstDir = multiLeft ? rightCur : leftCur;
 		if (dstDir instanceof MegaItem) {
 			uploadToMega(srcs, (MegaItem) dstDir, move);
 			return;
@@ -3265,6 +3276,215 @@ public class MainActivity extends Activity {
 			return;
 		}
 		fileOperations.startTransfer(s2, d2, move, move ? "Moving" : "Copying", move ? "Moved" : "Copied", renamed);
+	}
+
+	// ---------------------------------------------------------------- clipboard bar
+
+	/** long-press menu "Copy to clipboard": remembers the item(s); the bar at the bottom then asks for a destination */
+	void copyToClipboard() {
+		ArrayList<File> items = new ArrayList<File>();
+		boolean wasMulti = multiMode || !multi.isEmpty();
+		boolean side = multiLeft;
+		if (wasMulti) {
+			items = multiItems();
+		} else {
+			if (selected == null) {
+				toast("Select a file or folder first");
+				return;
+			}
+			File f = selected;
+			if (isPaneRoot(f)) {
+				toast("Select a file or folder inside the tree");
+				return;
+			}
+			if (ZipItem.isZipRoot(f))
+				f = ((ZipItem) f).zip;
+			items.add(f);
+		}
+		if (items.isEmpty()) {
+			toast("Nothing to copy");
+			return;
+		}
+		clipFiles = items;
+		clipMove = false;
+		// start with the folder shown in the other pane (the same default as Copy/Move); a tap on any folder replaces it
+		clipDest = selectedLeft ? rightCur : leftCur;
+		if (wasMulti) {
+			exitMulti();
+			refreshPane(side);
+		}
+		updateClipBar();
+		toast(items.size() == 1 ? "Copied to clipboard. Tap a destination folder, then PASTE"
+				: items.size() + " items copied to clipboard. Tap a destination folder, then PASTE");
+	}
+
+	/** a tap on a folder (tree row or breadcrumb) while the clipboard bar is shown makes it the paste destination */
+	void pickClipDest(File f) {
+		if (clipFiles.isEmpty() || f == null || !f.isDirectory())
+			return;
+		clipDest = f;
+		updateClipBar();
+	}
+
+	void clearClip() {
+		clipFiles = new ArrayList<File>();
+		clipDest = null;
+		clipMove = false;
+		updateClipBar();
+	}
+
+	String clipDestLabel(File f) {
+		if (isPaneRoot(f))
+			return displayRoot(f);
+		if (f instanceof MegaItem)
+			return "MEGA / " + f.getName();
+		return f.getAbsolutePath();
+	}
+
+	void updateClipBar() {
+		if (clipBar == null) {
+			if (clipFiles.isEmpty() || mainRoot == null)
+				return;
+			try {
+				clipBar = buildClipBar();
+				((LinearLayout) mainRoot).addView(clipBar, new LinearLayout.LayoutParams(-1, -2));
+			} catch (Exception e) {
+				clipBar = null;
+				toast("Clipboard bar failed: " + e);
+				return;
+			}
+		}
+		if (clipFiles.isEmpty()) {
+			clipBar.setVisibility(View.GONE);
+			return;
+		}
+		clipSrcText.setText(clipFiles.size() == 1 ? clipFiles.get(0).getName() : clipFiles.size() + " items");
+		clipDestText.setText(clipDest == null ? "tap a folder" : clipDestLabel(clipDest));
+		clipModeBox.setText((clipMove ? "\u2611" : "\u2610") + "  Move mode (delete source files)");
+		clipBar.setVisibility(View.VISIBLE);
+	}
+
+	LinearLayout buildClipBar() {
+		int accent = dark ? Color.rgb(110, 165, 255) : Color.rgb(25, 90, 210);
+		LinearLayout bar = new LinearLayout(this);
+		bar.setOrientation(LinearLayout.VERTICAL);
+		bar.setBackgroundColor(colSurfaceAlt);
+		bar.setVisibility(View.GONE);
+
+		View line = new View(this);
+		line.setBackgroundColor(colDivider);
+		bar.addView(line, new LinearLayout.LayoutParams(-1, 2 * dp));
+
+		LinearLayout head = new LinearLayout(this);
+		head.setOrientation(LinearLayout.HORIZONTAL);
+		head.setGravity(Gravity.CENTER_VERTICAL);
+		head.setPadding(10 * dp, 2 * dp, 0, 0);
+		TextView title = new TextView(this);
+		title.setText("\uD83D\uDCCB  Clipboard");
+		title.setTextSize(16);
+		title.setTextColor(colText);
+		head.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+		TextView close = new TextView(this);
+		close.setText("\u2715");
+		close.setTextSize(17);
+		close.setTextColor(colTextMuted);
+		close.setPadding(16 * dp, 8 * dp, 16 * dp, 8 * dp);
+		close.setContentDescription("Clear clipboard");
+		close.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				clearClip();
+			}
+		});
+		head.addView(close, new LinearLayout.LayoutParams(-2, -2));
+		bar.addView(head, new LinearLayout.LayoutParams(-1, -2));
+
+		LinearLayout mid = new LinearLayout(this);
+		mid.setOrientation(LinearLayout.HORIZONTAL);
+		mid.setGravity(Gravity.CENTER_VERTICAL);
+		mid.setPadding(10 * dp, 0, 10 * dp, 2 * dp);
+		clipSrcText = new TextView(this);
+		clipSrcText.setTextSize(14);
+		clipSrcText.setTextColor(colText);
+		clipSrcText.setSingleLine(true);
+		clipSrcText.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+		mid.addView(clipSrcText, new LinearLayout.LayoutParams(0, -2, 2));
+		TextView arrow = new TextView(this);
+		arrow.setText("  \u2192  ");
+		arrow.setTextSize(18);
+		arrow.setTextColor(accent);
+		mid.addView(arrow, new LinearLayout.LayoutParams(-2, -2));
+		clipDestText = new TextView(this);
+		clipDestText.setTextSize(14);
+		clipDestText.setTextColor(colText);
+		clipDestText.setSingleLine(true);
+		clipDestText.setEllipsize(android.text.TextUtils.TruncateAt.START);
+		mid.addView(clipDestText, new LinearLayout.LayoutParams(0, -2, 3));
+		bar.addView(mid, new LinearLayout.LayoutParams(-1, -2));
+
+		LinearLayout foot = new LinearLayout(this);
+		foot.setOrientation(LinearLayout.HORIZONTAL);
+		foot.setGravity(Gravity.CENTER_VERTICAL);
+		foot.setPadding(6 * dp, 0, 6 * dp, 2 * dp);
+		clipModeBox = new TextView(this);
+		clipModeBox.setTextSize(14);
+		clipModeBox.setTextColor(colText);
+		clipModeBox.setPadding(4 * dp, 10 * dp, 8 * dp, 10 * dp);
+		clipModeBox.setContentDescription("Toggle move mode");
+		clipModeBox.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				clipMove = !clipMove;
+				updateClipBar();
+			}
+		});
+		foot.addView(clipModeBox, new LinearLayout.LayoutParams(0, -2, 1));
+		TextView paste = new TextView(this);
+		paste.setText("PASTE");
+		paste.setTextSize(15);
+		paste.setTextColor(accent);
+		paste.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+		paste.setPadding(16 * dp, 10 * dp, 16 * dp, 10 * dp);
+		applyRipple(paste);
+		paste.setOnClickListener(new View.OnClickListener() {
+			public void onClick(View v) {
+				pasteClip();
+			}
+		});
+		foot.addView(paste, new LinearLayout.LayoutParams(-2, -2));
+		bar.addView(foot, new LinearLayout.LayoutParams(-1, -2));
+		return bar;
+	}
+
+	void pasteClip() {
+		if (clipFiles.isEmpty())
+			return;
+		if (clipDest == null || !clipDest.isDirectory()) {
+			toast("Tap a destination folder first");
+			return;
+		}
+		ArrayList<File> items = new ArrayList<File>();
+		for (int i = 0; i < clipFiles.size(); i++) {
+			File f = clipFiles.get(i);
+			boolean ok = f instanceof ZipItem ? ((ZipItem) f).zip.exists() : f instanceof MegaItem || f.exists();
+			if (ok)
+				items.add(f);
+		}
+		if (items.isEmpty()) {
+			clearClip();
+			toast("The copied items no longer exist");
+			return;
+		}
+		boolean mv = clipMove;
+		if (mv) {
+			for (int i = 0; i < items.size(); i++)
+				if (items.get(i) instanceof MegaItem && ((MegaItem) items.get(i)).isSystemNode()) {
+					toast("These MEGA folders cannot be moved");
+					return;
+				}
+		}
+		File dest = clipDest;
+		if (mv)
+			clearClip(); // the sources are gone after a move; a copy stays on the clipboard for more pastes
+		transferItems(items, dest, mv);
 	}
 
 	void delConfirmMulti() {
@@ -3591,6 +3811,10 @@ public class MainActivity extends Activity {
 			refresh(true, true, false);
 			return;
 		}
+		if (a == 50) {
+			copyToClipboard();
+			return;
+		}
 		if (multiMode) {
 			multiAction(a);
 			return;
@@ -3914,6 +4138,7 @@ public class MainActivity extends Activity {
 				addItem(labels, icons, codes, "\uD83D\uDCE4", "Share", 13);
 			}
 			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
+			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy to clipboard", 50);
 			if (!sys) {
 				addItem(labels, icons, codes, "\u2722", "Move", 2);
 				addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
@@ -3947,6 +4172,7 @@ public class MainActivity extends Activity {
 		if (zipEntry) {
 			// inside a zip: extract (Copy/Move), Rename, Delete, Info
 			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy (extract)", 1);
+			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy to clipboard", 50);
 			addItem(labels, icons, codes, "\u2722", "Move (extract)", 2);
 			addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
 			addItem(labels, icons, codes, "\u274C", "Delete", 5);
@@ -3955,6 +4181,7 @@ public class MainActivity extends Activity {
 			if (ZipItem.isZipRoot(f))
 				addItem(labels, icons, codes, "\u27A1\uFE0F", "Extract to other pane", 10);
 			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
+			addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy to clipboard", 50);
 			addItem(labels, icons, codes, "\u2722", "Move", 2);
 			addItem(labels, icons, codes, "\u270F\uFE0F", "Rename", 3);
 			if (plainFolder) { // new items are created inside the long-pressed folder, so only folders offer it
@@ -4047,6 +4274,7 @@ public class MainActivity extends Activity {
 		final ArrayList<String> icons = new ArrayList<String>();
 		final ArrayList<Integer> codes = new ArrayList<Integer>();
 		addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy", 1);
+		addItem(labels, icons, codes, "\uD83D\uDCCB", "Copy to clipboard", 50);
 		addItem(labels, icons, codes, "\u2722", "Move", 2);
 		addItem(labels, icons, codes, "\u270F\uFE0F", "Batch rename", 28);
 		addItem(labels, icons, codes, "\u274C", "Delete", 5);
@@ -4832,8 +5060,95 @@ public class MainActivity extends Activity {
 			megaDuplicate(one(selected));
 			return;
 		}
-		File dst = uniqueSibling(selected, "copy", null);
-		startTransfer(selected, dst, false, "Duplicating", "Duplicated");
+		showDuplicateDialog(selected);
+	}
+
+	/** "name (1).ext" in the same folder; the first free number */
+	String numberedName(File src, int n) {
+		String nm = src.getName(), ext = "";
+		int dot = nm.lastIndexOf('.');
+		if (!src.isDirectory() && dot > 0) {
+			ext = nm.substring(dot);
+			nm = nm.substring(0, dot);
+		}
+		return nm + " (" + n + ")" + ext;
+	}
+
+	/** Duplicate dialog: shows the item, the folder it is copied to, and an editable name (the " (1)" part is selected) */
+	void showDuplicateDialog(final File src) {
+		final File parent = src.getParentFile();
+		if (parent == null) {
+			toast("Cannot duplicate this item");
+			return;
+		}
+		int n = 1;
+		while (new File(parent, numberedName(src, n)).exists())
+			n++;
+		String suggested = numberedName(src, n);
+		AlertDialog.Builder b = createDialog("Duplicate", null);
+		android.content.Context cx = b.getContext();
+		LinearLayout box = new LinearLayout(cx);
+		box.setOrientation(LinearLayout.VERTICAL);
+		padDialogBox(box);
+		TextView info = new TextView(cx);
+		info.setTextSize(16);
+		info.setTextColor(dark ? Color.WHITE : Color.BLACK);
+		info.setText(src.getName() + "\n" + (src.isDirectory() ? "Folder" : human(src.length())) + "\nDuplicate to\n"
+				+ clipDestLabel(parent));
+		box.addView(info, new LinearLayout.LayoutParams(-1, -2));
+		final EditText e = new EditText(cx);
+		e.setSingleLine(true);
+		themeDialogView(e);
+		alignInput(e);
+		e.setText(suggested);
+		box.addView(e, new LinearLayout.LayoutParams(-1, -2));
+		final TextView warn = new TextView(cx);
+		warn.setText("Already exists");
+		warn.setTextColor(Color.rgb(230, 80, 70));
+		warn.setTextSize(13);
+		warn.setPadding(0, 2 * dp, 0, 0);
+		warn.setVisibility(View.GONE);
+		box.addView(warn, new LinearLayout.LayoutParams(-1, -2));
+		// select only the " (n)" part so typing replaces it
+		String ext = suggested.substring(suggested.lastIndexOf(" (") + 1);
+		int close = ext.indexOf(')');
+		int selStart = suggested.lastIndexOf(" (");
+		int selEnd = selStart + 1 + close + 1;
+		if (selStart >= 0 && selEnd <= suggested.length())
+			e.setSelection(selStart, selEnd);
+		final AlertDialog[] dlg = new AlertDialog[1];
+		e.addTextChangedListener(new android.text.TextWatcher() {
+			public void beforeTextChanged(CharSequence s, int st, int c, int af) {
+			}
+
+			public void onTextChanged(CharSequence s, int st, int bf, int c) {
+			}
+
+			public void afterTextChanged(android.text.Editable s) {
+				String nn = s.toString().trim();
+				boolean dup = nn.length() > 0 && new File(parent, nn).exists();
+				warn.setVisibility(dup ? View.VISIBLE : View.GONE);
+				if (dlg[0] != null) {
+					Button ok = dlg[0].getButton(DialogInterface.BUTTON_POSITIVE);
+					if (ok != null)
+						ok.setEnabled(!dup && nn.length() > 0);
+				}
+			}
+		});
+		b.setView(box).setPositiveButton("OK", new DialogInterface.OnClickListener() {
+			public void onClick(DialogInterface d, int w) {
+				String nn = e.getText().toString().trim();
+				if (nn.length() == 0 || nn.indexOf('/') >= 0)
+					return;
+				File dst = new File(parent, nn);
+				if (dst.exists()) {
+					toast("Already exists");
+					return;
+				}
+				startTransfer(src, dst, false, "Duplicating", "Duplicated");
+			}
+		}).setNegativeButton("Cancel", null);
+		dlg[0] = b.show();
 	}
 
 	void transfer(boolean move) {
